@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -12,165 +13,263 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/soren-labs/gpt-account/internal/app"
 	"github.com/soren-labs/gpt-account/internal/gpa"
 	"github.com/soren-labs/gpt-account/internal/httpapi"
 )
 
-func main() {
-	os.Exit(run(os.Args[1:]))
-}
-
+func main() { os.Exit(run(os.Args[1:])) }
 func run(args []string) int {
 	fs := flag.NewFlagSet("gpa-manager", flag.ContinueOnError)
-	store := fs.String("store", "", "account store")
-	listen := fs.String("listen", "127.0.0.1:0", "listen address")
-	noBrowser := fs.Bool("no-browser", false, "do not open a browser")
-	demo := fs.Bool("demo", false, "seed isolated demo accounts")
-	agentStdio := fs.Bool("agent-stdio", false, "JSON stdio bridge")
-	background := fs.Bool("background", false, "start without opening the browser")
-	testSession := fs.String("test-session", "", "test-only bootstrap (refuses the default store)")
+	root := fs.String("store", "", "account store")
+	listen := fs.String("listen", "127.0.0.1:0", "loopback listen address")
+	noBrowser := fs.Bool("no-browser", false, "do not open browser")
+	background := fs.Bool("background", false, "run background host")
+	demo := fs.Bool("demo", false, "isolated demo")
+	stdio := fs.Bool("agent-stdio", false, "forward one JSON request to host")
+	testSession := fs.String("test-session", "", "isolated demo bootstrap")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *background {
-		*noBrowser = true
+	if len(fs.Args()) != 0 {
+		return 2
 	}
-	if *demo && *store == "" {
-		*store = filepath.Join(os.TempDir(), "gpa-demo")
+	host, _, err := net.SplitHostPort(*listen)
+	if err != nil || host != "127.0.0.1" {
+		fmt.Fprintln(os.Stderr, "only 127.0.0.1 listeners are allowed")
+		return 2
 	}
-	cfg := gpa.LoadConfig(*store)
+	if *demo && *root == "" {
+		*root = filepath.Join(os.TempDir(), "gpa-demo")
+	}
+	if runtime.GOOS == "windows" && strings.HasPrefix(*root, "/mnt/") && len(*root) > 7 {
+		*root = strings.ToUpper((*root)[5:6]) + ":" + strings.ReplaceAll((*root)[6:], "/", `\`)
+	}
+	cfg := gpa.LoadConfig(*root)
+	if *stdio {
+		return runStdio(cfg.Store)
+	}
+	if *testSession != "" && !*demo {
+		fmt.Fprintln(os.Stderr, "--test-session requires an isolated demo")
+		return 2
+	}
+	if err := os.MkdirAll(cfg.Store, 0700); err != nil {
+		return 1
+	}
+	lock, err := gpa.AcquireLock(filepath.Join(cfg.Store, "manager.lock"))
+	if err != nil {
+		rt, e := waitRuntime(cfg.Store, 5*time.Second)
+		if e != nil {
+			fmt.Fprintln(os.Stderr, e)
+			return 1
+		}
+		if !*background && !*noBrowser {
+			_, _, e = callHost(cfg.Store, rt, "POST", "/api/v1/open-ui", `{}`)
+			if e != nil {
+				fmt.Fprintln(os.Stderr, e)
+				return 1
+			}
+		}
+		return 0
+	}
+	defer lock.Release()
 	if *demo {
+		marker := filepath.Join(cfg.Store, ".gpa-demo")
+		if _, err := os.Stat(marker); os.IsNotExist(err) {
+			if entries, _ := os.ReadDir(filepath.Join(cfg.Store, "accounts")); len(entries) > 0 {
+				fmt.Fprintln(os.Stderr, "refusing demo over an existing account store")
+				return 2
+			}
+			if err := os.WriteFile(marker, []byte("demo\n"), 0600); err != nil {
+				return 1
+			}
+		}
 		os.Setenv("GPA_STORE", cfg.Store)
 		os.Setenv("GPA_CODEX_HOME", filepath.Join(cfg.Store, "demo-wsl"))
 		os.Setenv("GPA_WINDOWS_CODEX", filepath.Join(cfg.Store, "demo-win"))
 		os.Setenv("GPA_CHATGPT", "off")
 		os.Setenv("GPA_IGNORE_CLI", "1")
 		cfg = gpa.LoadConfig(cfg.Store)
+	} else {
+		for _, key := range []string{"GPA_FAKE_APP", "GPA_FAKE_CLI", "GPA_IGNORE_CLI", "GPA_PROC_QUERY", "GPA_LOCK_REMOTE"} {
+			os.Unsetenv(key)
+		}
 	}
 	st := gpa.OpenStore(cfg)
-	if err := st.Ensure(); err != nil {
+	storeLock, err := gpa.AcquireLock(st.LockPath())
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	if *testSession != "" && samePath(cfg.Store, gpa.LoadConfig("").Store) && !*demo {
-		fmt.Fprintln(os.Stderr, "refusing --test-session on the default account store")
-		return 2
+	err = st.Ensure()
+	if err == nil && *demo && len(st.Names()) == 0 {
+		err = app.SeedDemo(st)
+	}
+	storeLock.Release()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
 	svc := app.New(st)
 	svc.Demo = *demo
 	if *demo {
-		if err := app.SeedDemo(st); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 1
-		}
 		svc.Probe = func(c gpa.Client) gpa.ClientState {
 			return gpa.ClientState{Client: c, Process: gpa.ProcNone, Presence: gpa.PresenceNone}
 		}
 	}
+	if err := svc.Recover(); err != nil {
+		fmt.Fprintln(os.Stderr, "recovery:", err)
+		return 1
+	}
 	srv := httpapi.New(svc)
 	srv.TestSession = *testSession
-	if tok, err := loadOrCreate(filepath.Join(st.Root, "agent.token"), srv.AgentToken); err == nil {
-		srv.AgentToken = tok
-	}
-	if *agentStdio {
-		return runStdio(srv)
+	srv.OpenBrowser = openBrowser
+	srv.AgentToken, err = loadOrCreate(filepath.Join(st.Root, "agent.token"), srv.AgentToken)
+	if err != nil {
+		return 1
 	}
 	ln, err := net.Listen("tcp", *listen)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	addr := ln.Addr().String()
-	host, port, _ := strings.Cut(addr, ":")
-	if host == "" {
-		host = "127.0.0.1"
+	defer ln.Close()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	srv.BaseURL = "http://127.0.0.1:" + port
+	exe, _ := os.Executable()
+	rt := runtimeRecord{Instance: srv.InstanceID, Port: port, PID: os.Getpid(), Exe: exe, URL: srv.BaseURL + "/"}
+	if err := writeRuntime(st.Root, rt); err != nil {
+		return 1
 	}
-	url := fmt.Sprintf("http://127.0.0.1:%s/#bootstrap=%s", port, srv.Bootstrap)
-	_ = writeRuntime(st.Root, map[string]any{
-		"instance": srv.InstanceID,
-		"port":     port,
-		"pid":      os.Getpid(),
-		"exe":      os.Args[0],
-		"url":      "http://127.0.0.1:" + port + "/",
-	})
-	fmt.Println("GPA Manager", url)
-	go http.Serve(ln, srv.Handler())
-	if !*noBrowser {
-		openBrowser("http://127.0.0.1:" + port + "/#bootstrap=" + srv.Bootstrap)
+	httpServer := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
+	if !*background && !*noBrowser {
+		go openBrowser(srv.BrowserURL(""))
 	}
-	select {}
+	fmt.Fprintln(os.Stderr, "GPA Manager", srv.BaseURL)
+	err = httpServer.Serve(ln)
+	if err != nil && err != http.ErrServerClosed {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	return 0
 }
 
-func runStdio(srv *httpapi.Server) int {
-	dec := json.NewDecoder(os.Stdin)
+type runtimeRecord struct {
+	Instance string `json:"instance"`
+	Port     string `json:"port"`
+	PID      int    `json:"pid"`
+	Exe      string `json:"exe"`
+	URL      string `json:"url"`
+}
+
+func loadRuntime(root string) (runtimeRecord, error) {
+	var rt runtimeRecord
+	raw, err := os.ReadFile(filepath.Join(root, "runtime.json"))
+	if err != nil {
+		return rt, err
+	}
+	err = json.Unmarshal(raw, &rt)
+	if err != nil {
+		return rt, err
+	}
+	c := &http.Client{Timeout: time.Second}
+	res, err := c.Get("http://127.0.0.1:" + rt.Port + "/api/v1/health")
+	if err != nil {
+		return rt, err
+	}
+	defer res.Body.Close()
+	var health struct {
+		Instance string `json:"instance"`
+	}
+	err = json.NewDecoder(res.Body).Decode(&health)
+	if err != nil || rt.Instance == "" || health.Instance != rt.Instance {
+		return rt, fmt.Errorf("GPA host identity mismatch")
+	}
+	return rt, nil
+}
+func waitRuntime(root string, timeout time.Duration) (runtimeRecord, error) {
+	end := time.Now().Add(timeout)
+	for time.Now().Before(end) {
+		if rt, err := loadRuntime(root); err == nil {
+			return rt, nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return runtimeRecord{}, fmt.Errorf("GPA host unavailable")
+}
+func callHost(root string, rt runtimeRecord, method, path, body string) (int, string, error) {
+	if !strings.HasPrefix(path, "/api/v1/") || strings.ContainsAny(path, "\r\n") {
+		return 0, "", fmt.Errorf("invalid API path")
+	}
+	token, err := os.ReadFile(filepath.Join(root, "agent.token"))
+	if err != nil {
+		return 0, "", err
+	}
+	req, err := http.NewRequest(method, "http://127.0.0.1:"+rt.Port+path, strings.NewReader(body))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	req.Header.Set("Content-Type", "application/json")
+	res, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return 0, "", err
+	}
+	defer res.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	return res.StatusCode, string(raw), err
+}
+func runStdio(root string) int {
 	enc := json.NewEncoder(os.Stdout)
-	for {
-		var req map[string]any
-		if err := dec.Decode(&req); err != nil {
-			if err == io.EOF {
-				return 0
-			}
-			enc.Encode(map[string]any{"error": err.Error()})
-			return 5
-		}
-		method, _ := req["method"].(string)
-		path, _ := req["path"].(string)
-		body, _ := req["body"].(string)
-		if method == "" || path == "" {
-			enc.Encode(map[string]any{"error": "method and path required"})
-			continue
-		}
-		httpReq, err := http.NewRequest(method, "http://bridge"+path, strings.NewReader(body))
-		if err != nil {
-			enc.Encode(map[string]any{"error": err.Error()})
-			continue
-		}
-		httpReq.Host = "127.0.0.1"
-		httpReq.Header.Set("Authorization", "Bearer "+srv.AgentToken)
-		httpReq.Header.Set("Content-Type", "application/json")
-		rec := newRecorder()
-		srv.Handler().ServeHTTP(rec, httpReq)
-		enc.Encode(map[string]any{"status": rec.code, "body": rec.buf.String()})
+	var req struct {
+		Method string `json:"method"`
+		Path   string `json:"path"`
+		Body   string `json:"body"`
 	}
+	dec := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		enc.Encode(map[string]any{"error": err.Error()})
+		return 5
+	}
+	rt, err := loadRuntime(root)
+	if err != nil {
+		self, _ := os.Executable()
+		cmd := exec.Command(self, "--background", "--store", root)
+		detach(cmd)
+		if err = cmd.Start(); err == nil {
+			cmd.Process.Release()
+			rt, err = waitRuntime(root, 10*time.Second)
+		}
+	}
+	if err != nil {
+		enc.Encode(map[string]any{"error": "TRANSPORT_UNAVAILABLE: " + err.Error()})
+		return 5
+	}
+	code, body, err := callHost(root, rt, req.Method, req.Path, req.Body)
+	if err != nil {
+		enc.Encode(map[string]any{"error": "TRANSPORT_UNAVAILABLE: " + err.Error()})
+		return 5
+	}
+	enc.Encode(map[string]any{"status": code, "body": json.RawMessage(body)})
+	return 0
 }
-
-type recorder struct {
-	code   int
-	header http.Header
-	buf    strings.Builder
-}
-
-func newRecorder() *recorder { return &recorder{code: 200, header: http.Header{}} }
-func (r *recorder) Header() http.Header { return r.header }
-func (r *recorder) Write(b []byte) (int, error) { return r.buf.Write(b) }
-func (r *recorder) WriteHeader(code int) { r.code = code }
-
 func loadOrCreate(path, fallback string) (string, error) {
-	if raw, err := os.ReadFile(path); err == nil {
-		s := strings.TrimSpace(string(raw))
-		if s != "" {
-			return s, nil
-		}
+	if raw, err := os.ReadFile(path); err == nil && len(bytes.TrimSpace(raw)) > 0 {
+		return string(bytes.TrimSpace(raw)), nil
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fallback, err
+	err := gpa.AtomicWriteFile(path, []byte(fallback+"\n"))
+	return fallback, err
+}
+func writeRuntime(root string, data any) error {
+	raw, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
 	}
-	return fallback, os.WriteFile(path, []byte(fallback+"\n"), 0o600)
+	return gpa.AtomicWriteFile(filepath.Join(root, "runtime.json"), append(raw, '\n'))
 }
-
-func writeRuntime(root string, data map[string]any) error {
-	raw, _ := json.MarshalIndent(data, "", "  ")
-	return os.WriteFile(filepath.Join(root, "runtime.json"), append(raw, '\n'), 0o600)
-}
-
-func samePath(a, b string) bool {
-	aa, _ := filepath.Abs(a)
-	bb, _ := filepath.Abs(b)
-	return aa != "" && aa == bb
-}
-
 func openBrowser(url string) {
 	var cmd *exec.Cmd
 	switch {

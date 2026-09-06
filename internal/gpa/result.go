@@ -14,21 +14,22 @@ type ClientResult struct {
 }
 
 type Result struct {
-	Status      string          `json:"status"`
-	Account     string          `json:"account,omitempty"`
-	Email       string          `json:"email,omitempty"`
-	Plan        string          `json:"plan,omitempty"`
-	WorkspaceID string          `json:"workspace_id,omitempty"`
-	UserID      string          `json:"user_id,omitempty"`
-	OperationID string          `json:"operation_id,omitempty"`
-	Clients     []ClientResult  `json:"clients,omitempty"`
-	Done        []string        `json:"done,omitempty"`
-	Todo        []string        `json:"todo,omitempty"`
-	Next        string          `json:"next,omitempty"`
-	Shared      []string        `json:"shared,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	Written     []string        `json:"written,omitempty"`
-	Adopted     []string        `json:"adopted,omitempty"`
+	Status         string         `json:"status"`
+	RecoveryStatus string         `json:"recovery_status,omitempty"`
+	Account        string         `json:"account,omitempty"`
+	Email          string         `json:"email,omitempty"`
+	Plan           string         `json:"plan,omitempty"`
+	WorkspaceID    string         `json:"workspace_id,omitempty"`
+	UserID         string         `json:"user_id,omitempty"`
+	OperationID    string         `json:"operation_id,omitempty"`
+	Clients        []ClientResult `json:"clients,omitempty"`
+	Done           []string       `json:"done,omitempty"`
+	Todo           []string       `json:"todo,omitempty"`
+	Next           string         `json:"next,omitempty"`
+	Shared         []string       `json:"shared,omitempty"`
+	Error          string         `json:"error,omitempty"`
+	Written        []string       `json:"written,omitempty"`
+	Adopted        []string       `json:"adopted,omitempty"`
 }
 
 func (r Result) ExitCode() int {

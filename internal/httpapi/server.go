@@ -4,9 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -16,11 +18,14 @@ import (
 )
 
 type Server struct {
-	Svc         *app.Service
-	Bootstrap   string
-	AgentToken  string
-	TestSession string
-	InstanceID  string
+	Svc             *app.Service
+	Bootstrap       string
+	AgentToken      string
+	TestSession     string
+	OpenBrowser     func(string)
+	BaseURL         string
+	bootstrapTokens map[string]time.Time
+	InstanceID      string
 
 	mu       sync.Mutex
 	sessions map[string]session
@@ -34,11 +39,12 @@ type session struct {
 
 func New(svc *app.Service) *Server {
 	return &Server{
-		Svc:        svc,
-		Bootstrap:  tokenHex(16),
-		AgentToken: tokenHex(16),
-		InstanceID: tokenHex(8),
-		sessions:   map[string]session{},
+		Svc:             svc,
+		Bootstrap:       tokenHex(16),
+		AgentToken:      tokenHex(16),
+		InstanceID:      tokenHex(8),
+		sessions:        map[string]session{},
+		bootstrapTokens: map[string]time.Time{},
 	}
 }
 
@@ -63,6 +69,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/operations/", s.auth(s.operationItem))
 	mux.HandleFunc("/api/v1/diagnostics", s.auth(s.diagnostics))
 	mux.HandleFunc("/api/v1/health", s.health)
+	mux.HandleFunc("/api/v1/open-ui", s.auth(s.openUI))
 	mux.HandleFunc("/", s.static)
 	return s.guard(mux)
 }
@@ -91,7 +98,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			}
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				origin := r.Header.Get("Origin")
-				if origin != "" && !localOrigin(origin) {
+				if origin != "" && (!localOrigin(origin) || origin != "http://"+r.Host) {
 					http.Error(w, `{"error":"bad origin"}`, http.StatusForbidden)
 					return
 				}
@@ -102,7 +109,50 @@ func (s *Server) guard(next http.Handler) http.Handler {
 }
 
 func localOrigin(origin string) bool {
-	return strings.HasPrefix(origin, "http://127.0.0.1") || strings.HasPrefix(origin, "http://localhost") || strings.HasPrefix(origin, "http://[::1]")
+	u, err := url.Parse(origin)
+	return err == nil && u.Scheme == "http" && u.User == nil && u.Path == "" && (u.Hostname() == "127.0.0.1" || u.Hostname() == "localhost" || u.Hostname() == "::1")
+}
+func (s *Server) BrowserURL(operation string) string {
+	token := tokenHex(24)
+	s.mu.Lock()
+	for k, t := range s.bootstrapTokens {
+		if time.Now().After(t) {
+			delete(s.bootstrapTokens, k)
+		}
+	}
+	s.bootstrapTokens[token] = time.Now().Add(2 * time.Minute)
+	s.mu.Unlock()
+	link := s.BaseURL + "/#bootstrap=" + token
+	if operation != "" {
+		link += "&operation=" + url.QueryEscape(operation)
+	}
+	return link
+}
+func (s *Server) openUI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method", 405)
+		return
+	}
+	var body struct {
+		OperationID string `json:"operation_id"`
+	}
+	if err := decodeStrict(r, &body); err != nil {
+		fail(w, err)
+		return
+	}
+	if body.OperationID != "" {
+		if _, err := s.Svc.GetOp(body.OperationID); err != nil {
+			fail(w, err)
+			return
+		}
+	}
+	if s.OpenBrowser == nil {
+		fail(w, fmt.Errorf("browser launcher unavailable"))
+		return
+	}
+	link := s.BrowserURL(body.OperationID)
+	s.OpenBrowser(link)
+	writeJSON(w, 200, map[string]any{"status": "ok", "url": link, "operation_id": body.OperationID})
 }
 
 func (s *Server) static(w http.ResponseWriter, r *http.Request) {
@@ -124,30 +174,47 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) session(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		if s.actorOf(r) != "ui" {
+			http.Error(w, `{"error":"unauthorized"}`, 401)
+			return
+		}
+		c, _ := r.Cookie("gpa_session")
+		s.mu.Lock()
+		sess := s.sessions[c.Value]
+		s.mu.Unlock()
+		writeJSON(w, 200, map[string]any{"csrf": sess.csrf, "demo": s.Svc.Demo})
+		return
+	}
 	if r.Method != http.MethodPost {
-		http.Error(w, `{"error":"method"}`, http.StatusMethodNotAllowed)
+		http.Error(w, `{"error":"method"}`, 405)
 		return
 	}
 	var body struct {
 		Bootstrap string `json:"bootstrap"`
 	}
-	_ = json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body)
-	ok := body.Bootstrap != "" && body.Bootstrap == s.Bootstrap && !s.usedBoot
+	if err := decodeStrict(r, &body); err != nil {
+		fail(w, err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	expiry, found := s.bootstrapTokens[body.Bootstrap]
+	ok := found && time.Now().Before(expiry)
+	if body.Bootstrap != "" && body.Bootstrap == s.Bootstrap && !s.usedBoot {
+		ok = true
+		s.usedBoot = true
+	}
 	if s.TestSession != "" && body.Bootstrap == s.TestSession {
 		ok = true
 	}
 	if !ok {
-		http.Error(w, `{"error":"invalid bootstrap"}`, http.StatusUnauthorized)
+		http.Error(w, `{"error":"invalid bootstrap"}`, 401)
 		return
 	}
-	if body.Bootstrap == s.Bootstrap {
-		s.usedBoot = true
-	}
-	sid := tokenHex(16)
-	csrf := tokenHex(16)
-	s.mu.Lock()
+	delete(s.bootstrapTokens, body.Bootstrap)
+	sid, csrf := tokenHex(16), tokenHex(16)
 	s.sessions[sid] = session{csrf: csrf, expiry: time.Now().Add(12 * time.Hour)}
-	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "gpa_session", Value: sid, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	writeJSON(w, 200, map[string]any{"csrf": csrf, "demo": s.Svc.Demo})
 }
@@ -223,6 +290,9 @@ func (s *Server) accounts(w http.ResponseWriter, r *http.Request) {
 		fail(w, err)
 		return
 	}
+	if r.URL.Query().Get("archived") == "true" {
+		view.Accounts = s.Svc.ArchivedAccounts()
+	}
 	writeJSON(w, 200, map[string]any{"accounts": view.Accounts})
 }
 
@@ -246,7 +316,7 @@ func (s *Server) accountItem(w http.ResponseWriter, r *http.Request) {
 			Archived    *bool   `json:"archived"`
 		}
 		if err := decodeStrict(r, &body); err != nil {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			fail(w, err)
 			return
 		}
 		name := ""
@@ -300,7 +370,7 @@ func (s *Server) logins(w http.ResponseWriter, r *http.Request) {
 		Account     string `json:"account"`
 	}
 	if err := decodeStrict(r, &body); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+		fail(w, err)
 		return
 	}
 	rec, err := s.Svc.StartLogin(body.DisplayName, body.Account)
@@ -350,7 +420,7 @@ func (s *Server) plans(w http.ResponseWriter, r *http.Request) {
 		Target  string `json:"target"`
 	}
 	if err := decodeStrict(r, &body); err != nil {
-		http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+		fail(w, err)
 		return
 	}
 	if body.Account == "" || body.Target == "" {
@@ -376,7 +446,7 @@ func (s *Server) operations(w http.ResponseWriter, r *http.Request) {
 			IdempotencyKey string `json:"idempotency_key"`
 		}
 		if err := decodeStrict(r, &body); err != nil {
-			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusBadRequest)
+			fail(w, err)
 			return
 		}
 		if body.PlanID == "" {
@@ -420,7 +490,10 @@ func (s *Server) operationItem(w http.ResponseWriter, r *http.Request) {
 			RequestID      string `json:"request_id"`
 			IdempotencyKey string `json:"idempotency_key"`
 		}
-		_ = decodeStrict(r, &body)
+		if err := decodeStrict(r, &body); err != nil {
+			fail(w, err)
+			return
+		}
 		var env app.Envelope
 		var err error
 		switch parts[1] {
@@ -429,22 +502,14 @@ func (s *Server) operationItem(w http.ResponseWriter, r *http.Request) {
 		case "retry":
 			env, err = s.Svc.Retry(id, body.RequestID, body.IdempotencyKey, r.Header.Get("X-GPA-Actor"))
 		case "cancel":
-			op, e2 := s.Svc.GetOp(id)
+			op, e2 := s.Svc.Cancel(id)
 			if e2 != nil {
 				fail(w, e2)
 				return
 			}
-			if op.Status == "running" {
-				http.Error(w, `{"error":"cannot cancel a write in progress"}`, http.StatusConflict)
-				return
-			}
-			if op.Status != "succeeded" {
-				op.Status = "cancelled"
-				op.Message = "已取消"
-				_ = s.Svc.SaveCancelled(op)
-			}
 			writeJSON(w, 200, op)
 			return
+
 		default:
 			http.NotFound(w, r)
 			return
@@ -476,10 +541,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 func decodeStrict(r *http.Request, dest any) error {
+	if r.Header.Get("Content-Type") != "application/json" {
+		return fmt.Errorf("Content-Type must be application/json")
+	}
 	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(dest); err != nil && err != io.EOF {
+	if err := dec.Decode(dest); err != nil {
 		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("expected one JSON document")
 	}
 	return nil
 }

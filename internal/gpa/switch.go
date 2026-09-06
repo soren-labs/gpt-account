@@ -59,6 +59,21 @@ type authCand struct {
 }
 
 func AdoptLives(store *Store, clients []Client) (adopted []string, conflicts []string) {
+	liveUpdates, conflicts := LatestLives(store, clients)
+	for name, auth := range liveUpdates {
+		if _, err := store.Put(name, auth, "live", true); err == nil {
+			adopted = append(adopted, name)
+		}
+	}
+	sort.Strings(adopted)
+	sort.Strings(conflicts)
+	return adopted, conflicts
+}
+
+// LatestLives only observes the clients. It does not mutate the account store,
+// so a switch can commit refreshed credentials together with its other writes.
+func LatestLives(store *Store, clients []Client) (updates map[string]map[string]any, conflicts []string) {
+	updates = map[string]map[string]any{}
 	lives := map[string][]authCand{}
 	for _, auth := range liveAuths(clients) {
 		id := InspectAuth(auth)
@@ -89,13 +104,10 @@ func AdoptLives(store *Store, clients []Client) (adopted []string, conflicts []s
 			conflicts = append(conflicts, name)
 			continue
 		}
-		if _, err := store.Put(name, best.auth, "live", true); err == nil {
-			adopted = append(adopted, name)
-		}
+		updates[name] = best.auth
 	}
-	sort.Strings(adopted)
 	sort.Strings(conflicts)
-	return adopted, conflicts
+	return updates, conflicts
 }
 
 func conflictingAuths(cands []authCand) bool {
@@ -173,6 +185,9 @@ func useAccount(store *Store, name, target string, force, open, dryRun, interact
 	states := map[string]ClientState{}
 	for _, c := range affected {
 		states[c.ID] = inspectClient(c)
+		if states[c.ID].ReasonCode == "QUERY_FAILED" {
+			return Result{Status: "blocked", Account: name, Error: "cannot query client state: " + c.Label}
+		}
 	}
 
 	selfRestart := false
@@ -209,7 +224,7 @@ func useAccount(store *Store, name, target string, force, open, dryRun, interact
 		}
 	}
 
-	if len(holdWrites) > 0 && (!force || len(holdWrites) == len(uniqueStorages(affected))) {
+	if len(holdWrites) > 0 {
 		op := pendingOp(name, target, force, open, selfRestart, busyCLI)
 		if operationID != "" {
 			op.ID = operationID
@@ -248,86 +263,75 @@ func useAccount(store *Store, name, target string, force, open, dryRun, interact
 		}
 	}
 
-	adopted, conflicts := AdoptLives(store, store.LoadClients())
-	if len(conflicts) > 0 && !force {
+	liveUpdates, conflicts := LatestLives(store, store.LoadClients())
+	if len(conflicts) > 0 {
 		res.Status = "blocked"
 		res.Error = "凭据新旧无法判断: " + joinComma(conflicts)
 		res.Todo = []string{"gpa doctor", "gpa use " + name + " --force"}
 		return res
 	}
 	var kept []string
-	for _, n := range adopted {
+	for n := range liveUpdates {
 		if n != name {
 			kept = append(kept, n)
 		}
 	}
+	sort.Strings(kept)
 	acct, _ = store.Get(name)
+	if latest, ok := liveUpdates[name]; ok {
+		acct.Auth = latest
+	}
 	id = acct.Identity()
 	res.Email = id.Email
 	res.Plan = id.Plan
 	res.Adopted = kept
 
-	type snap struct {
-		client Client
-		data   []byte
-		had    bool
-	}
-	var backups []snap
-	written := []string{}
-	seenPath := map[string]bool{}
-	rollback := func() {
-		for i := len(backups) - 1; i >= 0; i-- {
-			b := backups[i]
-			if !b.had {
-				_ = clientRemove(b.client)
-				continue
-			}
-			_ = clientWriteBytes(b.client, b.data)
-		}
-	}
-
-	stateBackup := store.State()
+	writable := []Client{}
 	skipped := []string{}
-	for _, storage := range uniqueStorages(affected) {
-		if holdWrites[storage] {
-			for _, c := range clientsForStorage(affected, storage) {
-				skipped = append(skipped, c.Label)
-			}
-			continue
+	for _, c := range affected {
+		if holdWrites[c.Storage] {
+			skipped = append(skipped, c.Label)
+		} else {
+			writable = append(writable, c)
 		}
-		group := clientsForStorage(affected, storage)
-		c := group[0]
-		path := c.AuthPath()
-		if seenPath[path] {
-			continue
-		}
-		seenPath[path] = true
-		old, err := clientReadBytes(c)
-		had := err == nil
-		backups = append(backups, snap{client: c, data: old, had: had})
-		if err := writeClientAuth(c, acct.Auth); err != nil {
-			rollback()
-			_ = store.WriteState(stateBackup)
-			res.Status = "failed"
-			res.Error = "write " + path + ": " + err.Error()
-			return res
-		}
-		written = append(written, path)
 	}
-	if err := store.SetCurrent(name); err != nil {
-		rollback()
-		_ = store.WriteState(stateBackup)
+	tx, err := prepareTransaction(store, writable, acct.Auth)
+	if err != nil {
 		res.Status = "failed"
 		res.Error = err.Error()
+		res.RecoveryStatus = "not_needed"
+		return res
+	}
+	rollback := func() {
+		if err := tx.rollback(store); err != nil {
+			res.RecoveryStatus = "failed"
+			res.Error += "; recovery failed: " + err.Error()
+		} else {
+			res.RecoveryStatus = "restored"
+		}
+	}
+	written := []string{}
+	for _, b := range tx.Files {
+		if err := clientWriteBytes(b.Client, tx.Next); err != nil {
+			res.Status = "failed"
+			res.Error = "write " + b.Client.Label + ": " + err.Error()
+			rollback()
+			return res
+		}
+		written = append(written, b.Client.AuthPath())
+	}
+	if err := store.SetCurrent(name); err != nil {
+		res.Status = "failed"
+		res.Error = err.Error()
+		rollback()
 		return res
 	}
 
 	if needAppRestart || (open && !chatgptRunning()) {
 		if !startChatGPT() {
-			rollback()
-			_ = store.WriteState(stateBackup)
 			res.Status = "failed"
 			res.Error = "could not start ChatGPT.exe"
+			rollback()
 			return res
 		}
 	}
@@ -339,14 +343,88 @@ func useAccount(store *Store, name, target string, force, open, dryRun, interact
 		c := clientsForStorage(affected, storage)[0]
 		got := loadClientAuth(c)
 		if got == nil || !SameSeat(InspectAuth(got), id) {
-			rollback()
-			_ = store.WriteState(stateBackup)
 			res.Status = "failed"
 			res.Error = "live auth mismatch after switch: " + c.AuthPath()
+			rollback()
 			return res
 		}
 	}
 
+	// Save refreshed live credentials only after all client files have passed
+	// verification. Keep a memory snapshot so a metadata write failure can
+	// restore the account library along with the client transaction.
+	type accountSnapshot struct {
+		name             string
+		auth, meta       []byte
+		authHad, metaHad bool
+	}
+	var accountBackups []accountSnapshot
+	for n := range liveUpdates {
+		dest, err := store.SlotDir(n)
+		if err != nil {
+			res.Status = "failed"
+			res.Error = err.Error()
+			rollback()
+			return res
+		}
+		var snap accountSnapshot
+		snap.name = n
+		snap.auth, err = os.ReadFile(filepath.Join(dest, "auth.json"))
+		if err == nil {
+			snap.authHad = true
+		} else if !os.IsNotExist(err) {
+			res.Status = "failed"
+			res.Error = err.Error()
+			rollback()
+			return res
+		}
+		snap.meta, err = os.ReadFile(filepath.Join(dest, "meta.json"))
+		if err == nil {
+			snap.metaHad = true
+		} else if !os.IsNotExist(err) {
+			res.Status = "failed"
+			res.Error = err.Error()
+			rollback()
+			return res
+		}
+		accountBackups = append(accountBackups, snap)
+	}
+	restoreAccounts := func() {
+		for _, snap := range accountBackups {
+			dest, err := store.SlotDir(snap.name)
+			if err != nil {
+				continue
+			}
+			if snap.authHad {
+				_ = atomicWrite(filepath.Join(dest, "auth.json"), snap.auth, 0o600)
+			} else {
+				_ = os.Remove(filepath.Join(dest, "auth.json"))
+			}
+			if snap.metaHad {
+				_ = atomicWrite(filepath.Join(dest, "meta.json"), snap.meta, 0o600)
+			} else {
+				_ = os.Remove(filepath.Join(dest, "meta.json"))
+			}
+		}
+	}
+	for n, latest := range liveUpdates {
+		if _, err := store.Put(n, latest, "live", true); err != nil {
+			res.Status = "failed"
+			res.Error = "saving refreshed credentials for " + n + ": " + err.Error()
+			rollback()
+			restoreAccounts()
+			return res
+		}
+	}
+
+	if err := os.Remove(journalPath(store)); err != nil {
+		res.Status = "failed"
+		res.Error = "could not finalize switch journal: " + err.Error()
+		rollback()
+		restoreAccounts()
+		return res
+	}
+	res.RecoveryStatus = "not_needed"
 	store.AppendLog("use", map[string]any{
 		"slot": name, "email": id.Email, "plan": id.Plan,
 		"written": written, "adopted": kept, "target": target, "skipped": skipped,
@@ -514,4 +592,28 @@ func SaveLive(store *Store, name string, force bool) (map[string]any, error) {
 	_ = store.SetCurrent(slot)
 	store.AppendLog("save", map[string]any{"slot": slot, "email": id.Email, "plan": id.Plan})
 	return meta, nil
+}
+
+// CredentialConflicts compares saved and live bundles without mutating either.
+func CredentialConflicts(store *Store, clients []Client) []string {
+	var conflicts []string
+	lives := liveAuths(clients)
+	for _, name := range store.Names() {
+		acct, err := store.Get(name)
+		if err != nil {
+			continue
+		}
+		t, ok := freshness(acct.Auth)
+		cands := []authCand{{auth: acct.Auth, t: t, ok: ok}}
+		for _, auth := range lives {
+			if SameSeat(InspectAuth(auth), acct.Identity()) {
+				t, ok := freshness(auth)
+				cands = append(cands, authCand{auth: auth, t: t, ok: ok})
+			}
+		}
+		if conflictingAuths(cands) {
+			conflicts = append(conflicts, name)
+		}
+	}
+	return conflicts
 }

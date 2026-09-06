@@ -58,23 +58,16 @@ func (s *Service) Preview(accountRef, targetID string) (Plan, error) {
 			already = false
 		}
 	}
-	if already && decision == "ready" {
-		if conflict, msg := s.credentialConflict(acct, affected); conflict {
-			decision = "blocked"
-			reason = "CREDENTIAL_CONFLICT"
-			detail = msg
-			already = false
-		} else {
-			decision = "noop"
-			detail = "所选范围已经是这个账号"
-		}
-	} else if decision == "ready" {
-		if conflict, msg := s.credentialConflict(acct, affected); conflict {
-			decision = "blocked"
-			reason = "CREDENTIAL_CONFLICT"
-			detail = msg
-		}
+	if conflicts := gpa.CredentialConflicts(s.Store, clients); len(conflicts) > 0 {
+		decision = "blocked"
+		reason = "CREDENTIAL_CONFLICT"
+		detail = "凭据版本冲突: " + strings.Join(conflicts, ", ")
+		already = false
+	} else if already && decision == "ready" {
+		decision = "noop"
+		detail = "所选范围已经是这个账号"
 	}
+
 	plan := Plan{
 		ID:             newID("plan_"),
 		Account:        acct.Name,
@@ -140,19 +133,27 @@ func targetToCLI(id string) string {
 	}
 }
 
-func (s *Service) Submit(planID, requestID, idem string, actor string) (Envelope, error) {
-	return s.submit(planID, requestID, idem, actor, false)
+func (s *Service) Submit(planID, requestID, idem, actor string) (Envelope, error) {
+	release, err := s.lockMutation()
+	if err != nil {
+		return Envelope{}, err
+	}
+	defer release()
+	return s.submit(planID, requestID, idem, actor, false, nil)
 }
 
-func (s *Service) submit(planID, requestID, idem, actor string, confirmRestart bool) (Envelope, error) {
-	if requestID == "" {
-		requestID = newID("req_")
-	}
-	if idem == "" {
-		idem = requestID
+func (s *Service) submit(planID, requestID, idem, actor string, confirm bool, existing *OpRecord) (Envelope, error) {
+	requestID = or(requestID, newID("req_"))
+	idem = or(idem, requestID)
+	signature := "submit:" + planID
+	if existing != nil {
+		signature = "retry:" + existing.ID
+		if confirm {
+			signature = "confirm:" + existing.ID
+		}
 	}
 	if prev, ok := s.lookupIdem(idem); ok {
-		if prev.PlanID != planID {
+		if prev.Requests[idem] != signature {
 			return Envelope{}, errf("idempotency key reused with a different request")
 		}
 		return s.envelope(prev, requestID), nil
@@ -161,111 +162,96 @@ func (s *Service) submit(planID, requestID, idem, actor string, confirmRestart b
 	if err != nil {
 		return Envelope{}, err
 	}
-	if expired(plan.ExpiresAt) {
-		return Envelope{Status: "blocked", ReasonCode: "PLAN_STALE", Message: "预览已过期，请重新检查", RequestID: requestID}, nil
+	if existing == nil && expired(plan.ExpiresAt) {
+		return Envelope{Status: "blocked", ReasonCode: "PLAN_STALE", RequestID: requestID, Message: "预览已过期，请重新检查"}, nil
 	}
-	fresh, err := s.Preview(plan.Account, plan.Target)
+	fresh, err := s.Preview(plan.AccountID, plan.Target)
 	if err != nil {
 		return Envelope{}, err
 	}
-	if scopeGrew(plan, fresh) || fresh.Revision != plan.Revision {
-		return Envelope{Status: "blocked", ReasonCode: "PLAN_STALE", Message: "账号或范围已变化，请查看新的预览", RequestID: requestID}, nil
+	stale := scopeGrew(plan, fresh) || fresh.Revision != plan.Revision
+	if stale && existing == nil {
+		return Envelope{Status: "blocked", ReasonCode: "PLAN_STALE", RequestID: requestID, Message: "账号或范围已变化，请重新预览"}, nil
 	}
-	op := OpRecord{
-		ID:             newID("op_"),
-		CreatedAt:      nowISO(),
-		UpdatedAt:      nowISO(),
-		Kind:           "switch",
-		Account:        plan.Account,
-		AccountID:      plan.AccountID,
-		Target:         plan.Target,
-		Targets:        []string{plan.Target},
-		RequestID:      requestID,
-		PlanID:         plan.ID,
-		IdempotencyKey: idem,
-		Actor:          actor,
-		Attempt:        1,
-		Phase:          "checking",
-		Recovery:       map[string]any{"status": "not_needed"},
+	op := OpRecord{ID: newID("op_"), CreatedAt: nowISO(), Kind: "switch", Account: fresh.Account, AccountID: fresh.AccountID, Target: fresh.Target, Targets: []string{fresh.Target}, Attempt: 1, Recovery: map[string]any{"status": "not_needed"}, Requests: map[string]string{}}
+	if existing != nil {
+		op = *existing
+		op.Attempt++
+		if op.Requests == nil {
+			op.Requests = map[string]string{}
+		}
 	}
-	if fresh.Decision == "noop" {
-		op.Status = "succeeded"
-		op.Phase = "verifying"
-		op.Message = fresh.Message
-		_ = s.saveOp(op)
-		s.saveIdem(idem, op)
-		return s.envelope(op, requestID), nil
+	op.UpdatedAt = nowISO()
+	op.RequestID = requestID
+	op.IdempotencyKey = idem
+	op.Actor = actor
+	op.Phase = "checking"
+	op.ReasonCode = ""
+	op.PlanID = fresh.ID
+	op.Requests[idem] = signature
+	if stale && confirm {
+		confirm = false
 	}
-	if fresh.Decision == "blocked" {
+	switch {
+	case fresh.Decision == "blocked":
 		op.Status = "blocked"
 		op.ReasonCode = fresh.ReasonCode
 		op.Message = fresh.Message
-		_ = s.saveOp(op)
-		s.saveIdem(idem, op)
-		return s.envelope(op, requestID), nil
-	}
-	if fresh.Decision == "waiting_user" && !confirmRestart {
-		op.Status = "waiting_user"
-		op.ReasonCode = fresh.ReasonCode
+	case fresh.Decision == "noop":
+		op.Status = "succeeded"
 		op.Message = fresh.Message
-		_ = s.saveOp(op)
-		s.saveIdem(idem, op)
-		return s.envelope(op, requestID), nil
-	}
-	if fresh.ReasonCode == "APP_RESTART_REQUIRED" && actor != "ui" && !confirmRestart {
-		op.Status = "waiting_user"
-		op.ReasonCode = "APP_RESTART_REQUIRED"
-		op.Message = "桌面应用正在运行，需要在管理页面确认重启。"
-		_ = s.saveOp(op)
-		s.saveIdem(idem, op)
-		return s.envelope(op, requestID), nil
-	}
-	if fresh.ReasonCode == "CLI_IN_USE" {
+	case fresh.ReasonCode == "CLI_IN_USE":
 		op.Status = "waiting_user"
 		op.ReasonCode = "CLI_IN_USE"
 		op.Message = fresh.Message
-		_ = s.saveOp(op)
-		s.saveIdem(idem, op)
+	case fresh.ReasonCode == "APP_RESTART_REQUIRED" && (!confirm || actor != "ui"):
+		op.Status = "waiting_user"
+		op.ReasonCode = "APP_RESTART_REQUIRED"
+		op.Message = fresh.Message
+		if stale {
+			op.Message = "账号或影响范围已变化，请重新确认。" + fresh.Message
+		}
+	default:
+		op.Status = "running"
+		op.Phase = "writing"
+	}
+	if err := s.saveOp(op); err != nil {
+		return Envelope{}, err
+	}
+	if op.Status != "running" {
 		return s.envelope(op, requestID), nil
 	}
-	op.Status = "running"
-	op.Phase = "writing"
-	_ = s.saveOp(op)
-	res := s.switchAccount(plan.Account, targetToCLI(plan.Target), confirmRestart || fresh.ReasonCode == "APP_RESTART_REQUIRED" && actor == "ui")
+	res := s.switchAccount(fresh.Account, targetToCLI(fresh.Target), confirm && actor == "ui")
 	op.UpdatedAt = nowISO()
+	op.Message = res.Error
 	switch res.Status {
 	case "completed":
 		op.Status = "succeeded"
 		op.Phase = "verifying"
 		op.Message = "已切换本地凭据"
-		if confirmRestart {
-			op.Message = "已切换本地凭据 · 应用已重新打开"
-		}
-		op.Recovery = map[string]any{"status": "not_needed"}
 	case "pending":
 		op.Status = "waiting_user"
+		op.ReasonCode = "CLIENT_IN_USE"
 		op.Message = first(res.Todo, res.Error)
-		if strings.Contains(op.Message, "CLI") || strings.Contains(op.Message, "Codex") {
-			op.ReasonCode = "CLI_IN_USE"
-		} else {
-			op.ReasonCode = "APP_RESTART_REQUIRED"
-		}
 	case "blocked":
 		op.Status = "blocked"
 		op.ReasonCode = "BLOCKED"
-		op.Message = res.Error
 	default:
 		op.Status = "failed"
 		op.Phase = "restoring"
-		op.Message = res.Error
-		if res.Error == "" {
-			op.Message = "切换失败"
-		}
-		op.Recovery = map[string]any{"status": "restored"}
 	}
+	recovery := res.RecoveryStatus
+	if recovery == "" {
+		recovery = "not_needed"
+		if res.Status == "failed" {
+			recovery = "unknown"
+		}
+	}
+	op.Recovery = map[string]any{"status": recovery}
 	op.Result = map[string]any{"legacy_status": res.Status, "written": res.Written}
-	_ = s.saveOp(op)
-	s.saveIdem(idem, op)
+	if err := s.saveOp(op); err != nil {
+		return Envelope{Status: "failed", OperationID: op.ID, RequestID: requestID, ReasonCode: "RESULT_NOT_SAVED", Message: "操作结果未能保存，请检查客户端状态: " + err.Error()}, nil
+	}
 	return s.envelope(op, requestID), nil
 }
 
@@ -273,68 +259,58 @@ func (s *Service) Confirm(id, requestID, actor string) (Envelope, error) {
 	if actor != "ui" {
 		return Envelope{}, errf("restart confirmation requires the web session")
 	}
+	return s.resume(id, requestID, "", actor, true)
+}
+func (s *Service) Retry(id, requestID, idem, actor string) (Envelope, error) {
+	return s.resume(id, requestID, idem, actor, false)
+}
+func (s *Service) resume(id, requestID, idem, actor string, confirm bool) (Envelope, error) {
+	release, err := s.lockMutation()
+	if err != nil {
+		return Envelope{}, err
+	}
+	defer release()
 	op, err := s.GetOp(id)
 	if err != nil {
 		return Envelope{}, err
 	}
-	if op.Status == "succeeded" || op.Status == "cancelled" {
+	if op.Status == "succeeded" || op.Status == "cancelled" || op.Status == "running" {
 		return s.envelope(op, requestID), nil
 	}
-	if op.PlanID == "" {
-		return Envelope{}, errf("operation has no plan")
+	if rec, _ := op.Recovery["status"].(string); rec == "failed" || rec == "unknown" {
+		return Envelope{Status: "blocked", OperationID: op.ID, ReasonCode: "RECOVERY_FAILED", Message: "请先检查并处理恢复状态"}, nil
 	}
-	env, err := s.submit(op.PlanID, or(requestID, op.RequestID), op.IdempotencyKey+"-confirm", actor, true)
-	if err != nil {
-		return Envelope{}, err
+	if confirm && (op.Status != "waiting_user" || op.ReasonCode != "APP_RESTART_REQUIRED") {
+		return Envelope{}, errf("this operation does not await restart confirmation")
 	}
-	if env.OperationID != "" && env.OperationID != op.ID {
-		fresh, e2 := s.GetOp(env.OperationID)
-		if e2 == nil {
-			_ = os.Remove(s.opPath(env.OperationID))
-			fresh.ID = op.ID
-			fresh.Attempt = op.Attempt + 1
-			_ = s.saveOp(fresh)
-			env.OperationID = op.ID
-		}
-	}
-	return env, nil
+	return s.submit(op.PlanID, requestID, idem, actor, confirm, &op)
 }
-
-func (s *Service) Retry(id, requestID, idem, actor string) (Envelope, error) {
+func (s *Service) Cancel(id string) (OpRecord, error) {
+	release, err := s.lockMutation()
+	if err != nil {
+		return OpRecord{}, err
+	}
+	defer release()
 	op, err := s.GetOp(id)
 	if err != nil {
-		return Envelope{}, err
+		return op, err
 	}
-	if rec, _ := op.Recovery["status"].(string); rec == "failed" {
-		return Envelope{Status: "blocked", ReasonCode: "RECOVERY_FAILED", Message: "先处理恢复失败", OperationID: op.ID, RequestID: requestID}, nil
+	if op.Status == "running" {
+		return op, errf("cannot cancel a write in progress")
 	}
-	if op.PlanID == "" {
-		return Envelope{}, errf("operation has no plan")
+	if op.Status != "succeeded" {
+		op.Status = "cancelled"
+		op.Message = "已取消"
+		err = s.saveOp(op)
 	}
-	if idem == "" {
-		idem = or(requestID, newID("req_"))
-	}
-	env, err := s.submit(op.PlanID, or(requestID, op.RequestID), idem, actor, false)
-	if err != nil {
-		return Envelope{}, err
-	}
-	if env.OperationID != "" && env.OperationID != op.ID {
-		// keep original id for retries of waiting/blocked ops
-		if op.Status == "waiting_user" || op.Status == "blocked" || op.Status == "failed" {
-			fresh, _ := s.GetOp(env.OperationID)
-			fresh.ID = op.ID
-			fresh.Attempt = op.Attempt + 1
-			_ = os.Remove(s.opPath(env.OperationID))
-			_ = s.saveOp(fresh)
-			env.OperationID = op.ID
-		}
-	}
-	return env, nil
+	return op, err
 }
-
-func (s *Service) SaveCancelled(op OpRecord) error { return s.saveOp(op) }
+func (s *Service) SaveCancelled(op OpRecord) error { _, err := s.Cancel(op.ID); return err }
 
 func (s *Service) GetOp(id string) (OpRecord, error) {
+	if !gpa.ValidSlotName(id) {
+		return OpRecord{}, errf("invalid operation id")
+	}
 	raw, err := os.ReadFile(s.opPath(id))
 	if err != nil {
 		op, e2 := s.Store.GetOperation(id)
@@ -432,6 +408,9 @@ func (s *Service) savePlan(p Plan) error {
 }
 
 func (s *Service) loadPlan(id string) (Plan, error) {
+	if !gpa.ValidSlotName(id) {
+		return Plan{}, errf("invalid plan id")
+	}
 	raw, err := os.ReadFile(filepath.Join(s.plansDir(), id+".json"))
 	if err != nil {
 		return Plan{}, errf("unknown plan")
@@ -449,30 +428,12 @@ func (s *Service) saveOp(op OpRecord) error {
 }
 
 func (s *Service) lookupIdem(key string) (OpRecord, bool) {
-	data := map[string]string{}
-	raw, err := os.ReadFile(s.idemPath())
-	if err == nil {
-		_ = json.Unmarshal(raw, &data)
+	for _, op := range s.ListOps(0) {
+		if _, ok := op.Requests[key]; ok {
+			return op, true
+		}
 	}
-	id := data[key]
-	if id == "" {
-		return OpRecord{}, false
-	}
-	op, err := s.GetOp(id)
-	if err != nil {
-		return OpRecord{}, false
-	}
-	return op, true
-}
-
-func (s *Service) saveIdem(key string, op OpRecord) {
-	data := map[string]string{}
-	raw, err := os.ReadFile(s.idemPath())
-	if err == nil {
-		_ = json.Unmarshal(raw, &data)
-	}
-	data[key] = op.ID
-	_ = writeJSON(s.idemPath(), data)
+	return OpRecord{}, false
 }
 
 func scopeGrew(old, fresh Plan) bool {

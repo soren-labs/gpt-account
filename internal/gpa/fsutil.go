@@ -95,3 +95,6 @@ func copyFile(src, dst string) error {
 	}
 	return atomicWrite(dst, data, 0o600)
 }
+
+// AtomicWriteFile is shared by the service's durable metadata and operation records.
+func AtomicWriteFile(path string, data []byte) error { return atomicWrite(path, data, 0o600) }

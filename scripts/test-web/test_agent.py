@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,9 @@ def main() -> int:
     env["GPA_STORE"] = str(store)
     env["GPA_FORCE_LOOPBACK"] = "1"
     env["PATH"] = str(Path.home() / ".local/go/bin") + os.pathsep + env.get("PATH", "")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     proc = subprocess.Popen(
         [
             str(ROOT / "dist" / "gpa-manager"),
@@ -25,7 +29,7 @@ def main() -> int:
             "--store",
             str(store),
             "--listen",
-            "127.0.0.1:18766",
+            f"127.0.0.1:{port}",
             "--no-browser",
             "--test-session",
             "demoboot",
@@ -39,7 +43,7 @@ def main() -> int:
         deadline = time.time() + 15
         while time.time() < deadline:
             try:
-                urllib.request.urlopen("http://127.0.0.1:18766/api/v1/health", timeout=1)
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/health", timeout=1)
                 break
             except Exception:
                 if proc.poll() is not None:

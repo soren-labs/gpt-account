@@ -30,7 +30,10 @@
       <h2>你的账号</h2>
       <button type="button" id="btn-add" class="primary">＋添加账号</button>
     </section>
-    <p id="empty" class="empty" hidden>还没有保存的账号。可以导入已有账号，或添加一个新账号。</p>
+    <div id="empty" class="empty" hidden>
+      <p>还没有保存的账号。可以导入已有账号，或添加一个新账号。</p>
+      <button type="button" id="btn-import">导入已有账号</button>
+    </div>
     <ul id="accounts" class="list"></ul>
     <p id="result" class="result" hidden></p>
   </main>
@@ -80,6 +83,7 @@
     <p id="settings-body" class="note"></p>
     <menu>
       <button type="button" id="settings-import">导入已有账号</button>
+      <button type="button" id="settings-archived">已归档账号</button>
       <button type="button" id="settings-diag">查看诊断</button>
       <button type="button" id="settings-close">关闭</button>
     </menu>

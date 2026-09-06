@@ -135,6 +135,9 @@ func wslReadFile(distro, posix string) ([]byte, error) {
 }
 
 func wslWriteFile(distro, posix string, data []byte) error {
+	if err := safePath(posix); err != nil {
+		return err
+	}
 	q := shellQuote(posix)
 	script := "set -euo pipefail; umask 077; dir=$(dirname -- " + q + "); mkdir -p -- \"$dir\"; tmp=$(mktemp -- \"$dir/.gpa-XXXXXX\"); trap 'rm -f -- \"$tmp\"' EXIT; cat > \"$tmp\"; mv -f -- \"$tmp\" " + q + "; trap - EXIT"
 	cmd := wslCmd(distro, script)

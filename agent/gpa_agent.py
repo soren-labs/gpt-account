@@ -7,6 +7,10 @@ import argparse
 import json
 import os
 import sys
+import subprocess
+import uuid
+import socket
+import re
 import time
 import urllib.error
 import urllib.request
@@ -32,23 +36,43 @@ def fail(code: int, status: str, message: str, reason: str = "") -> int:
     return code
 
 
+def in_wsl() -> bool:
+    return bool(os.environ.get("WSL_DISTRO_NAME")) or Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+
+
+def native_path(value: str) -> Path:
+    if in_wsl() and re.match(r"^[A-Za-z]:[\\/]", value):
+        return Path("/mnt/" + value[0].lower() + "/" + value[3:].replace("\\", "/"))
+    return Path(value)
+
+
+def windows_path(path: Path) -> str:
+    value = str(path)
+    if value.startswith("/mnt/") and len(value) > 7:
+        return value[5].upper() + ":" + value[6:].replace("/", "\\")
+    if value.startswith("/") and in_wsl():
+        distro = os.environ.get("WSL_DISTRO_NAME")
+        if not distro:
+            raise RuntimeError("TRANSPORT_UNAVAILABLE: WSL distro name is unavailable")
+        return "\\\\wsl.localhost\\" + distro + value.replace("/", "\\")
+    return value
+
+
 def store_dir() -> Path:
-    override = os.environ.get("GPA_STORE")
-    if override:
-        return Path(override)
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        return Path(local) / "gpa"
-    wsl = Path("/mnt/c/Users")
-    if wsl.exists():
-        user = os.environ.get("USER", "zheng")
-        # Prefer the Windows user profile when running inside WSL.
-        win_home = os.environ.get("USERPROFILE")
-        if win_home and win_home.startswith("C:"):
-            drive = "/mnt/" + win_home[0].lower()
-            rest = win_home[2:].replace("\\", "/").lstrip("/")
-            return Path(drive) / rest / "AppData/Local/gpa"
-        return Path.home() / ".local/share/gpa"
+    if os.environ.get("GPA_STORE"):
+        return native_path(os.environ["GPA_STORE"])
+    if os.environ.get("LOCALAPPDATA"):
+        return native_path(os.environ["LOCALAPPDATA"]) / "gpa"
+    if in_wsl():
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "[Environment]::GetFolderPath('LocalApplicationData')"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+        for line in reversed(result.stdout.splitlines()):
+            if re.match(r"^[A-Za-z]:[\\/]", line.strip()):
+                return native_path(line.strip()) / "gpa"
+        raise RuntimeError("TRANSPORT_UNAVAILABLE: Windows profile discovery failed")
     return Path.home() / ".local/share/gpa"
 
 
@@ -57,109 +81,95 @@ def runtime_info() -> dict[str, Any]:
     if not path.is_file():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
         return {}
+    return value if isinstance(value, dict) else {}
 
 
-def agent_token() -> str:
-    path = store_dir() / "agent.token"
-    if path.is_file():
-        return path.read_text(encoding="utf-8").strip()
-    return os.environ.get("GPA_AGENT_TOKEN", "")
-
-
-def loopback_ok(port: str) -> bool:
-    try:
-        urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/health", timeout=1)
-        return True
-    except Exception:
-        return False
-
-
-def in_wsl() -> bool:
-    return bool(os.environ.get("WSL_DISTRO_NAME")) or Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
-
-
-def windows_exe() -> str | None:
+def manager_exe() -> str:
+    candidates = []
+    if os.environ.get("GPA_MANAGER_EXE"):
+        candidates.append(native_path(os.environ["GPA_MANAGER_EXE"]))
     rt = runtime_info()
-    exe = rt.get("exe")
-    if exe and Path(str(exe)).exists():
-        return str(exe)
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        cand = Path(local) / "gpa" / "bin" / "GPA Manager.exe"
-        if cand.exists():
-            return str(cand)
-    wsl_exe = Path("/mnt/c/Users")
-    if wsl_exe.exists():
-        guessed = Path.home()
-        # common WSL bind of Windows LocalAppData
-        p = Path("/mnt/c/Users/zheng/AppData/Local/gpa/bin/gpa-manager.exe")
-        if p.exists():
+    if rt.get("exe"):
+        candidates.append(native_path(str(rt["exe"])))
+    for name in ("GPA Manager.exe", "gpa-manager.exe", "gpa-manager"):
+        repo = Path(__file__).resolve().parent.parent
+        candidates.extend([
+            store_dir() / "bin" / name,
+            repo / name,
+            repo / "dist" / name,
+        ])
+    for p in candidates:
+        if p.is_file():
             return str(p)
-    return None
+    raise RuntimeError("TRANSPORT_UNAVAILABLE: open GPA Manager once or configure GPA_MANAGER_EXE")
+
+
+def checked_runtime() -> dict[str, Any]:
+    rt = runtime_info()
+    if not str(rt.get("port", "")).isdigit():
+        raise RuntimeError("TRANSPORT_UNAVAILABLE: manager is not running")
+    with urllib.request.urlopen(f"http://127.0.0.1:{rt['port']}/api/v1/health", timeout=1) as response:
+        health = json.load(response)
+    if not rt.get("instance") or health.get("instance") != rt["instance"]:
+        raise RuntimeError("TRANSPORT_UNAVAILABLE: manager identity mismatch")
+    return rt
+
+
+def ensure_host() -> dict[str, Any]:
+    try:
+        return checked_runtime()
+    except (OSError, ValueError, RuntimeError):
+        exe = manager_exe()
+        kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+        if os.name == "nt":
+            kw["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kw["start_new_session"] = True
+        subprocess.Popen([exe, "--background", "--store", str(store_dir())], **kw)
+        end = time.monotonic() + 10
+        while time.monotonic() < end:
+            try:
+                return checked_runtime()
+            except (OSError, ValueError, RuntimeError):
+                time.sleep(0.1)
+        raise RuntimeError("TRANSPORT_UNAVAILABLE: manager did not start")
 
 
 def http_json(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
-    token = agent_token()
-    if not token:
-        raise RuntimeError("TRANSPORT_UNAVAILABLE: missing agent.token")
-    rt = runtime_info()
-    port = rt.get("port")
-    if port and (os.environ.get("GPA_FORCE_LOOPBACK") or loopback_ok(str(port))):
-        pass
-    elif in_wsl():
+    if in_wsl() and not os.environ.get("GPA_FORCE_LOOPBACK"):
         return stdio_json(method, path, body)
-    if not port:
-        raise RuntimeError("TRANSPORT_UNAVAILABLE: manager is not running")
-    data = None if body is None else json.dumps(body).encode()
+    rt = ensure_host()
+    token = (store_dir() / "agent.token").read_text(encoding="utf-8").strip()
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+        f"http://127.0.0.1:{rt['port']}{path}",
+        data=None if body is None else json.dumps(body).encode(), method=method,
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            raw = resp.read().decode("utf-8", "replace")
-            return resp.status, json.loads(raw) if raw else {}
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return resp.status, json.load(resp)
     except urllib.error.HTTPError as err:
-        raw = err.read().decode("utf-8", "replace")
-        try:
-            parsed = json.loads(raw) if raw else {"error": err.reason}
-        except json.JSONDecodeError:
-            parsed = {"error": raw or err.reason}
-        return err.code, parsed
+        return err.code, json.loads(err.read().decode())
 
 
 def stdio_json(method: str, path: str, body: dict[str, Any] | None) -> tuple[int, dict[str, Any]]:
-    exe = windows_exe()
-    if not exe:
-        raise RuntimeError("TRANSPORT_UNAVAILABLE: Windows GPA Manager is not installed")
-    import subprocess
-
-    payload = json.dumps({"method": method, "path": path, "body": json.dumps(body or {})}) + "\n"
     proc = subprocess.run(
-        [exe, "--agent-stdio", "--store", str(store_dir())],
-        input=payload.encode(),
-        capture_output=True,
-        check=False,
+        [manager_exe(), "--agent-stdio", "--store", windows_path(store_dir())],
+        input=json.dumps({"method": method, "path": path, "body": json.dumps(body or {})}).encode(),
+        capture_output=True, timeout=75, check=False,
     )
-    if proc.returncode != 0 and not proc.stdout:
-        raise RuntimeError("TRANSPORT_UNAVAILABLE: stdio bridge failed")
-    line = proc.stdout.decode("utf-8", "replace").strip().splitlines()[-1]
-    parsed = json.loads(line)
-    if "error" in parsed and "status" not in parsed:
+    if not proc.stdout:
+        raise RuntimeError("TRANSPORT_UNAVAILABLE: Windows bridge returned no response")
+    parsed = json.loads(proc.stdout.decode("utf-8"))
+    if "error" in parsed:
         raise RuntimeError(str(parsed["error"]))
-    inner = parsed.get("body") or "{}"
+    inner = parsed.get("body") or {}
     if isinstance(inner, str):
-        inner = json.loads(inner) if inner else {}
-    return int(parsed.get("status", 200)), inner
+        inner = json.loads(inner)
+    return int(parsed["status"]), inner
 
 
 def envelope_from(data: dict[str, Any], request_id: str = "") -> dict[str, Any]:
@@ -224,7 +234,7 @@ def cmd_switch(ns: argparse.Namespace) -> int:
         return fail(4, "failed", "plan_id is required", "AMBIGUOUS")
     body = {
         "plan_id": ns.plan_id,
-        "request_id": ns.request_id or f"req_{int(time.time())}",
+        "request_id": ns.request_id or "req_" + uuid.uuid4().hex,
         "idempotency_key": ns.request_id or ns.plan_id,
     }
     code, data = http_json("POST", "/api/v1/operations", body)
@@ -245,12 +255,16 @@ def cmd_operation(ns: argparse.Namespace) -> int:
 
 
 def cmd_wait(ns: argparse.Namespace) -> int:
-    deadline = time.time() + (ns.timeout or 30)
+    if ns.timeout < 0:
+        return fail(4, "failed", "timeout must be nonnegative", "INVALID_ARGUMENT")
+    deadline = time.time() + ns.timeout
     last: dict[str, Any] = {}
     while time.time() < deadline:
         code, data = http_json("GET", f"/api/v1/operations/{ns.id}")
         last = data
-        if code < 400 and data.get("status") in {"succeeded", "failed", "blocked", "cancelled"}:
+        if code >= 400:
+            return fail(5, "failed", data.get("error", "operation query failed"), "TRANSPORT")
+        if data.get("status") in {"succeeded", "failed", "blocked", "cancelled", "waiting_user"}:
             print(json.dumps({"schema_version": SCHEMA, "status": "ok", "operation": data}, ensure_ascii=False, indent=2))
             return exit_for(str(data.get("status")))
         time.sleep(1)
@@ -266,11 +280,10 @@ def cmd_retry(ns: argparse.Namespace) -> int:
     return exit_for(str(data.get("status")))
 
 
-def cmd_open_ui(_: argparse.Namespace) -> int:
-    rt = runtime_info()
-    url = rt.get("url") or "http://127.0.0.1/"
-    print(json.dumps({"schema_version": SCHEMA, "status": "ok", "url": url, "next_action": {"type": "open_ui"}}, ensure_ascii=False, indent=2))
-    return 0
+def cmd_open_ui(ns: argparse.Namespace) -> int:
+    code, data = http_json("POST", "/api/v1/open-ui", {"operation_id": ns.id or ""})
+    print(json.dumps({"schema_version": SCHEMA, **data}, ensure_ascii=False, indent=2))
+    return 0 if code < 400 else 5
 
 
 def cmd_diagnose(_: argparse.Namespace) -> int:
@@ -297,8 +310,13 @@ def cmd_archive(ns: argparse.Namespace, archived: bool) -> int:
     return 0
 
 
+class JSONParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise ValueError(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="gpa_agent.py")
+    p = JSONParser(prog="gpa_agent.py")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     sub.add_parser("accounts")
@@ -316,7 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     rt = sub.add_parser("retry")
     rt.add_argument("--id", required=True)
     rt.add_argument("--request-id")
-    sub.add_parser("open-ui")
+    ui = sub.add_parser("open-ui")
+    ui.add_argument("--id")
     sub.add_parser("diagnose")
     sub.add_parser("import-preview")
     sub.add_parser("import-apply")
@@ -337,8 +356,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ns = build_parser().parse_args(argv)
+    ns = None
     try:
+        ns = build_parser().parse_args(argv)
         if ns.cmd == "status":
             return cmd_status(ns)
         if ns.cmd == "accounts":
@@ -384,7 +404,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"schema_version": SCHEMA, "status": "ok", "login": data}, ensure_ascii=False, indent=2))
             return 0 if code < 400 else 5
         return fail(4, "failed", "unknown command", "AMBIGUOUS")
-    except RuntimeError as err:
+    except ValueError as err:
+        return fail(4, "failed", str(err), "INVALID_ARGUMENT")
+    except (OSError, RuntimeError, subprocess.SubprocessError, socket.timeout) as err:
         msg = str(err)
         reason = "TRANSPORT_UNAVAILABLE" if "TRANSPORT_UNAVAILABLE" in msg else "TRANSPORT"
         return fail(5, "failed", msg, reason)

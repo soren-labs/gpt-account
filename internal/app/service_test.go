@@ -55,6 +55,21 @@ func TestStatusListsThreeSeats(t *testing.T) {
 	}
 }
 
+func TestStatusOpensForEmptyInstallation(t *testing.T) {
+	root := t.TempDir()
+	store := gpa.OpenStore(gpa.LoadConfig(root))
+	if err := store.Ensure(); err != nil {
+		t.Fatal(err)
+	}
+	view, err := New(store).Status("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view.Accounts) != 0 {
+		t.Fatalf("unexpected empty status: %+v", view)
+	}
+}
+
 func TestPreviewAndIdempotentSwitch(t *testing.T) {
 	svc := demoSvc(t)
 	wrote := 0

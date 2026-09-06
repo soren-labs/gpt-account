@@ -23,18 +23,18 @@ type NextAction struct {
 }
 
 type AccountView struct {
-	ID                  string         `json:"id"`
-	Slot                string         `json:"slot"`
-	DisplayName         string         `json:"display_name"`
-	LegacyAliases       []string       `json:"legacy_aliases,omitempty"`
-	EmailHint           string         `json:"email_hint"`
-	Email               string         `json:"email,omitempty"`
-	Plan                string         `json:"plan"`
-	Archived            bool           `json:"archived"`
-	CredentialRevision  int            `json:"credential_revision"`
-	ConfiguredOn        []string       `json:"configured_on,omitempty"`
-	CurrentOn           []string       `json:"current_on,omitempty"`
-	Verification        map[string]any `json:"verification"`
+	ID                 string         `json:"id"`
+	Slot               string         `json:"slot"`
+	DisplayName        string         `json:"display_name"`
+	LegacyAliases      []string       `json:"legacy_aliases,omitempty"`
+	EmailHint          string         `json:"email_hint"`
+	Email              string         `json:"email,omitempty"`
+	Plan               string         `json:"plan"`
+	Archived           bool           `json:"archived"`
+	CredentialRevision int            `json:"credential_revision"`
+	ConfiguredOn       []string       `json:"configured_on,omitempty"`
+	CurrentOn          []string       `json:"current_on,omitempty"`
+	Verification       map[string]any `json:"verification"`
 }
 
 type TargetView struct {
@@ -67,25 +67,26 @@ type Plan struct {
 }
 
 type OpRecord struct {
-	ID             string         `json:"id"`
-	CreatedAt      string         `json:"created_at"`
-	UpdatedAt      string         `json:"updated_at,omitempty"`
-	Kind           string         `json:"kind"`
-	Account        string         `json:"account"`
-	AccountID      string         `json:"account_id,omitempty"`
-	Target         string         `json:"target"`
-	Targets        []string       `json:"targets,omitempty"`
-	Status         string         `json:"status"`
-	Phase          string         `json:"phase,omitempty"`
-	ReasonCode     string         `json:"reason_code,omitempty"`
-	Message        string         `json:"message,omitempty"`
-	RequestID      string         `json:"request_id,omitempty"`
-	PlanID         string         `json:"plan_id,omitempty"`
-	IdempotencyKey string         `json:"idempotency_key,omitempty"`
-	Actor          string         `json:"actor,omitempty"`
-	Attempt        int            `json:"attempt,omitempty"`
-	Recovery       map[string]any `json:"recovery,omitempty"`
-	Result         map[string]any `json:"result,omitempty"`
+	ID             string            `json:"id"`
+	CreatedAt      string            `json:"created_at"`
+	UpdatedAt      string            `json:"updated_at,omitempty"`
+	Kind           string            `json:"kind"`
+	Account        string            `json:"account"`
+	AccountID      string            `json:"account_id,omitempty"`
+	Target         string            `json:"target"`
+	Targets        []string          `json:"targets,omitempty"`
+	Status         string            `json:"status"`
+	Phase          string            `json:"phase,omitempty"`
+	ReasonCode     string            `json:"reason_code,omitempty"`
+	Message        string            `json:"message,omitempty"`
+	RequestID      string            `json:"request_id,omitempty"`
+	PlanID         string            `json:"plan_id,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
+	Actor          string            `json:"actor,omitempty"`
+	Requests       map[string]string `json:"requests,omitempty"`
+	Attempt        int               `json:"attempt,omitempty"`
+	Recovery       map[string]any    `json:"recovery,omitempty"`
+	Result         map[string]any    `json:"result,omitempty"`
 }
 
 type LoginRecord struct {

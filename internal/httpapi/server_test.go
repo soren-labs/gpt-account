@@ -156,3 +156,77 @@ func TestAccountsOmitTokens(t *testing.T) {
 		t.Fatal(raw.String())
 	}
 }
+
+func TestOpenUIReturnsOneTimeBrowserURL(t *testing.T) {
+	s, client, base := testServer(t)
+	var opened string
+	s.OpenBrowser = func(url string) { opened = url }
+	cookie, csrf := openSession(t, client, base)
+	req, _ := http.NewRequest(http.MethodPost, base+"/api/v1/open-ui", strings.NewReader(`{"operation_id":""}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", "gpa_session="+cookie)
+	req.Header.Set("X-CSRF-Token", csrf)
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var out map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if res.StatusCode != http.StatusOK || opened == "" || out["url"] != opened || !strings.Contains(opened, "#bootstrap=") {
+		t.Fatalf("status=%d opened=%q response=%v", res.StatusCode, opened, out)
+	}
+}
+
+func TestSessionSurvivesReload(t *testing.T) {
+	_, client, base := testServer(t)
+	cookie, csrf := openSession(t, client, base)
+	req, _ := http.NewRequest("GET", base+"/api/v1/session", nil)
+	req.Header.Set("Cookie", "gpa_session="+cookie)
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var out map[string]any
+	json.NewDecoder(res.Body).Decode(&out)
+	if res.StatusCode != 200 || out["csrf"] != csrf {
+		t.Fatal(res.Status, out)
+	}
+}
+func TestRejectsLoopbackPrefixAndWrongPort(t *testing.T) {
+	_, client, base := testServer(t)
+	for _, origin := range []string{"http://localhost.evil.example", "http://127.0.0.1.evil.example", "http://127.0.0.1:1"} {
+		req, _ := http.NewRequest("POST", base+"/api/v1/session", strings.NewReader(`{"bootstrap":"demo-boot"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Origin", origin)
+		res, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != 403 {
+			t.Fatal(origin, res.StatusCode)
+		}
+	}
+}
+func TestMalformedConfirmRejectedBeforeAction(t *testing.T) {
+	s, client, base := testServer(t)
+	req, _ := http.NewRequest("POST", base+"/api/v1/operations/id/confirm", strings.NewReader(`{"force":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+s.AgentToken)
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var result map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&result); err != nil {
+		t.Fatal("error is not JSON", err)
+	}
+	if res.StatusCode != 400 {
+		t.Fatal(res.Status)
+	}
+}

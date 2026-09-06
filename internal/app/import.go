@@ -11,6 +11,9 @@ import (
 func (s *Service) ImportPreview() (ImportPreview, error) {
 	prev := ImportPreview{}
 	for _, src := range legacySources() {
+		if filepath.Clean(src) == filepath.Clean(s.Store.Root) {
+			continue
+		}
 		accounts := filepath.Join(src, "accounts")
 		if !dirOK(accounts) {
 			continue
@@ -47,23 +50,50 @@ func (s *Service) ImportPreview() (ImportPreview, error) {
 }
 
 func (s *Service) ImportApply() (map[string]int, error) {
+	release, err := s.lockMutation()
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	prev, err := s.ImportPreview()
 	if err != nil {
 		return nil, err
 	}
-	added := 0
+	counts := map[string]int{"added": 0, "skipped": 0, "conflicts": 0}
 	for _, src := range prev.Sources {
-		res, err := gpa.MigrateFrom(s.Store, src, false)
+		entries, err := os.ReadDir(filepath.Join(src, "accounts"))
 		if err != nil {
-			continue
+			return counts, err
 		}
-		if n, ok := res["imported"].([]string); ok {
-			added += len(n)
-		} else if raw, ok := res["imported"].([]any); ok {
-			added += len(raw)
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			auth, err := readMap(filepath.Join(src, "accounts", e.Name(), "auth.json"))
+			if err != nil || !gpa.IsChatGPTBundle(gpa.InspectAuth(auth)) {
+				continue
+			}
+			existing := s.Store.FindByIdentity(gpa.InspectAuth(auth))
+			if existing != "" {
+				a, _ := s.Store.Get(existing)
+				if refreshOf(a.Auth) == refreshOf(auth) {
+					counts["skipped"]++
+				} else {
+					counts["conflicts"]++
+				}
+				continue
+			}
+			if _, err := s.Store.Get(e.Name()); err == nil {
+				counts["conflicts"]++
+				continue
+			}
+			if _, err := s.Store.Put(e.Name(), auth, "legacy-import", false); err != nil {
+				return counts, err
+			}
+			counts["added"]++
 		}
 	}
-	return map[string]int{"added": added, "skipped": len(prev.Mergeable), "conflicts": len(prev.Conflicts)}, nil
+	return counts, nil
 }
 
 func (s *Service) Diagnostics() map[string]any {

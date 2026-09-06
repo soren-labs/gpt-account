@@ -26,12 +26,12 @@ const (
 )
 
 type ClientState struct {
-	Client       Client    `json:"client"`
-	Process      ProcState `json:"process"`
-	Presence     Presence  `json:"presence,omitempty"`
-	ReasonCode   string    `json:"reason_code,omitempty"`
-	Detail       string    `json:"detail,omitempty"`
-	Managed      bool      `json:"managed"`
+	Client     Client    `json:"client"`
+	Process    ProcState `json:"process"`
+	Presence   Presence  `json:"presence,omitempty"`
+	ReasonCode string    `json:"reason_code,omitempty"`
+	Detail     string    `json:"detail,omitempty"`
+	Managed    bool      `json:"managed"`
 }
 
 func queryFailed() bool {
@@ -301,11 +301,15 @@ func inspectClient(c Client) ClientState {
 	if c.Kind == "app" {
 		app := appState()
 		st.Process = app.Process
+		st.Presence = app.Presence
+		st.ReasonCode = app.ReasonCode
 		st.Detail = app.Detail
 		return st
 	}
 	cli := cliState(c)
 	st.Process = cli.Process
+	st.Presence = cli.Presence
+	st.ReasonCode = cli.ReasonCode
 	st.Detail = cli.Detail
 	return st
 }

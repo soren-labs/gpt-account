@@ -4,6 +4,8 @@ const state = {
   target: localStorage.getItem('gpa.target') || '',
   busy: false,
   pendingOp: '',
+  activeLogin: sessionStorage.getItem('gpa.login') || '',
+  mustChooseTarget: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -36,13 +38,15 @@ async function api(path, opts = {}) {
 async function bootstrap() {
   const hash = new URLSearchParams(location.hash.replace(/^#/, ''));
   const token = hash.get('bootstrap');
+  state.pendingOp = hash.get('operation') || '';
   if (token) {
     const out = await api('/api/v1/session', { method: 'POST', body: JSON.stringify({ bootstrap: token }) });
     state.csrf = out.csrf;
     history.replaceState(null, '', location.pathname);
     return;
   }
-  throw new Error('需要从 GPA 启动器打开');
+  const out = await api('/api/v1/session');
+  state.csrf = out.csrf;
 }
 
 function currentOn(account) {
@@ -57,11 +61,12 @@ function render() {
   const sel = $('target');
   const prev = state.target || st.selected_target;
   sel.innerHTML = '';
+  if (state.mustChooseTarget) { const o = document.createElement('option'); o.value = ''; o.textContent = '请选择切换范围'; sel.appendChild(o); }
   for (const t of st.targets || []) {
     const opt = document.createElement('option');
     opt.value = t.id;
     opt.textContent = t.label;
-    if (t.id === prev) opt.selected = true;
+    if (!state.mustChooseTarget && t.id === prev) opt.selected = true;
     sel.appendChild(opt);
   }
   state.target = sel.value;
@@ -74,7 +79,7 @@ function render() {
   for (const a of accounts) {
     const li = document.createElement('li');
     li.className = 'row';
-    const on = (a.current_on || []).some((id) => (t?.members || []).includes(id));
+    const on = (t?.members || []).length > 0 && t.members.every((id) => (a.current_on || []).includes(id));
     li.innerHTML = `
       <div>
         <div class="name">${escapeText(a.display_name)}</div>
@@ -85,6 +90,8 @@ function render() {
         <button type="button" class="more" data-id="${escapeAttr(a.id)}" aria-haspopup="true">⋯</button>
       </div>`;
     list.appendChild(li);
+    const switchButton = li.querySelector('.switch');
+    if (switchButton) switchButton.disabled = state.busy || !st.connected || !state.target;
   }
 }
 
@@ -97,17 +104,21 @@ async function refresh() {
   try {
     state.status = await api('/api/v1/status?target=' + encodeURIComponent(state.target || ''));
     if (state.target && !(state.status.targets || []).some((t) => t.id === state.target)) {
-      state.target = state.status.selected_target;
+      state.target = ''; state.mustChooseTarget = true;
       localStorage.removeItem('gpa.target');
     }
-    render();
+    if (!document.querySelector('.menu-list')) render();
   } catch (err) {
+    if (err.message.includes('unknown target')) { state.target = ''; state.mustChooseTarget = true; localStorage.removeItem('gpa.target'); await refresh(); return; }
+    if (state.status) state.status.connected = false;
+    $('conn').textContent = '服务断开';
+    document.querySelectorAll('.switch').forEach((b) => { b.disabled = true; });
     showBanner('服务暂时断开，列表可能过期。' + err.message, 'offline');
   }
 }
 
 async function doSwitch(accountId) {
-  if (state.busy) return;
+  if (state.busy || !state.target) return;
   state.busy = true;
   document.querySelectorAll('.switch').forEach((b) => { b.disabled = true; });
   try {
@@ -122,17 +133,6 @@ async function doSwitch(accountId) {
     if (plan.decision === 'noop') {
       setResult(plan.message || '无需切换');
       return;
-    }
-    if (plan.decision === 'waiting_user' && plan.reason_code === 'APP_RESTART_REQUIRED') {
-      $('confirm-title').textContent = '重启并切换到 ' + findName(accountId);
-      $('confirm-body').textContent = (plan.shared_note ? plan.shared_note + '。' : '') + '将更新：' + (plan.members || []).join('、');
-      $('dlg-confirm').returnValue = '';
-      $('dlg-confirm').showModal();
-      const ok = await dialogResult('dlg-confirm', 'confirm-ok', 'confirm-cancel');
-      if (!ok) {
-        setResult('已取消，没有写入。');
-        return;
-      }
     }
     const env = await api('/api/v1/operations', {
       method: 'POST',
@@ -150,11 +150,14 @@ async function doSwitch(accountId) {
 async function handleEnv(env) {
   state.pendingOp = env.operation_id || '';
   if (env.status === 'waiting_user' && env.reason_code === 'APP_RESTART_REQUIRED') {
-    $('confirm-title').textContent = '重启并切换';
-    $('confirm-body').textContent = env.message || '';
+    const op = await api('/api/v1/operations/' + env.operation_id);
+    $('confirm-title').textContent = '重启并切换到 ' + findName(op.account_id);
+    const target = state.status?.targets?.find((t) => t.id === op.target);
+    $('confirm-body').textContent = (env.message || '') + ' · ' + (target?.label || op.target) + (target?.shared_note ? ' · ' + target.shared_note : '');
     $('dlg-confirm').showModal();
     const ok = await dialogResult('dlg-confirm', 'confirm-ok', 'confirm-cancel');
     if (!ok) {
+      await api('/api/v1/operations/' + env.operation_id + '/cancel', { method: 'POST', body: '{}' });
       setResult('已取消，没有写入。');
       return;
     }
@@ -190,14 +193,19 @@ function setResult(msg) {
 function dialogResult(dlg, okId, cancelId) {
   return new Promise((resolve) => {
     const d = $(dlg);
+    let finished = false;
     const done = (v) => {
-      $(okId).onclick = null;
-      $(cancelId).onclick = null;
-      d.close();
+      if (finished) return;
+      finished = true;
+      $(okId).onclick = null; $(cancelId).onclick = null;
+      d.removeEventListener('cancel', cancelled); d.removeEventListener('close', closed);
+      if (d.open) d.close();
       resolve(v);
     };
-    $(okId).onclick = () => done(true);
-    $(cancelId).onclick = () => done(false);
+    const cancelled = (e) => { e.preventDefault(); done(false); };
+    const closed = () => done(false);
+    d.addEventListener('cancel', cancelled); d.addEventListener('close', closed);
+    $(okId).onclick = () => done(true); $(cancelId).onclick = () => done(false);
   });
 }
 
@@ -240,42 +248,86 @@ function openMenu(btn) {
   });
 }
 
-async function startLogin() {
-  const rec = await api('/api/v1/logins', {
-    method: 'POST',
-    body: JSON.stringify({ display_name: $('add-name').value, account: $('add-start').dataset.account || '' }),
-  });
-  $('add-status').textContent = '等待官方授权…';
-  if (rec.user_code) {
-    $('add-code').hidden = false;
-    $('add-code').textContent = rec.user_code + (rec.verification_url ? ' · ' + rec.verification_url : '');
-    $('add-open').hidden = !rec.verification_url;
-    $('add-copy').hidden = !rec.user_code;
-    $('add-open').onclick = () => window.open(rec.verification_url, '_blank', 'noopener');
-    $('add-copy').onclick = () => navigator.clipboard.writeText(rec.user_code);
-  }
-  const timer = setInterval(async () => {
-    const cur = await api('/api/v1/logins/' + rec.id);
-    $('add-status').textContent = cur.message || cur.status;
+let loginTimer;
+async function pollLogin() {
+  if (!state.activeLogin) return;
+  try {
+    const cur = await api('/api/v1/logins/' + state.activeLogin);
+    $('add-status').textContent = cur.message || ({starting: '正在启动官方登录…', waiting_authorization: '请在官方页面完成授权'}[cur.status] || cur.status);
+    $('add-code').hidden = !cur.user_code;
+    $('add-code').textContent = cur.user_code || '';
+    $('add-open').hidden = !cur.verification_url;
+    $('add-copy').hidden = !cur.user_code;
+    $('add-open').onclick = () => window.open(cur.verification_url, '_blank', 'noopener');
+    $('add-copy').onclick = () => navigator.clipboard.writeText(cur.user_code);
     if (['succeeded', 'failed', 'cancelled', 'expired'].includes(cur.status)) {
-      clearInterval(timer);
-      if (cur.status === 'succeeded') {
-        $('dlg-add').close();
-        setResult(cur.updated_existing ? '已更新授权' : '已添加账号');
-        await refresh();
-      }
+      state.activeLogin = ''; sessionStorage.removeItem('gpa.login');
+      $('add-start').disabled = false;
+      if (cur.status === 'succeeded') { $('dlg-add').close(); setResult(cur.updated_existing ? '已更新授权' : '已添加账号'); await refresh(); }
+      return;
     }
-  }, 1000);
-  $('add-cancel').onclick = async () => {
-    clearInterval(timer);
-    await api('/api/v1/logins/' + rec.id + '/cancel', { method: 'POST', body: '{}' });
-    $('dlg-add').close();
-  };
+  } catch (err) { $('add-status').textContent = err.message; }
+  loginTimer = setTimeout(pollLogin, 1000);
+}
+async function startLogin() {
+  if (state.activeLogin) return;
+  $('add-start').disabled = true;
+  try {
+    const rec = await api('/api/v1/logins', { method: 'POST', body: JSON.stringify({display_name: $('add-name').value, account: $('add-start').dataset.account || ''}) });
+    state.activeLogin = rec.id; sessionStorage.setItem('gpa.login', rec.id);
+    await pollLogin();
+  } catch (err) { $('add-status').textContent = err.message; $('add-start').disabled = false; }
+}
+async function cancelLogin() {
+  clearTimeout(loginTimer);
+  try {
+    if (state.activeLogin) await api('/api/v1/logins/' + state.activeLogin + '/cancel', {method:'POST',body:'{}'});
+    state.activeLogin = ''; sessionStorage.removeItem('gpa.login'); $('add-start').disabled = false; $('dlg-add').close();
+  } catch (err) { $('add-status').textContent = err.message; }
+}
+async function continueOperation(id) {
+  if (state.busy) return;
+  state.busy = true;
+  try {
+    const op = await api('/api/v1/operations/' + id);
+    if (op.status === 'waiting_user') { await handleEnv({...op, operation_id: op.id}); }
+    else if (op.status === 'blocked' || op.status === 'failed') { await handleEnv(await api('/api/v1/operations/' + id + '/retry', {method:'POST',body:JSON.stringify({request_id:crypto.randomUUID()})})); }
+    else { setResult(op.message || op.status); }
+  } catch (err) { setResult(err.message); }
+  finally { state.busy = false; await refresh(); }
+}
+async function showOperations() {
+  try {
+    const data = await api('/api/v1/operations');
+    $('ops-list').innerHTML = (data.operations || []).map((op) => `<li><strong>${escapeText(findName(op.account_id) || op.account)}</strong> ${escapeText(op.target)} · ${escapeText(op.status)}<div class="meta">${escapeText(op.message || '')}</div>${['waiting_user','blocked','failed'].includes(op.status) ? `<button data-operation="${escapeAttr(op.id)}">继续处理</button>` : ''}</li>`).join('') || '<li>还没有操作</li>';
+    $('dlg-ops').showModal();
+  } catch (err) { setResult(err.message); }
+}
+async function showArchived() {
+  const data = await api('/api/v1/accounts?archived=true');
+  $('detail-title').textContent = '已归档账号';
+  $('detail-body').innerHTML = (data.accounts || []).map((a) => `<p>${escapeText(a.display_name)} <button data-restore="${escapeAttr(a.id)}">恢复</button></p>`).join('') || '没有归档账号';
+  $('dlg-detail').showModal();
+}
+
+async function importAccounts() {
+  try {
+    const prev = await api('/api/v1/imports/preview', { method: 'POST', body: '{}' });
+    if (!(prev.new || []).length) {
+      setResult('没有可导入的新账号');
+      return;
+    }
+    const res = await api('/api/v1/imports', { method: 'POST', body: '{}' });
+    setResult('新增 ' + res.added + ' 个，跳过 ' + res.skipped + ' 个，冲突 ' + res.conflicts + ' 个');
+    await refresh();
+  } catch (err) {
+    setResult(err.message);
+  }
 }
 
 function wire() {
   $('target').addEventListener('change', async () => {
-    state.target = $('target').value;
+    state.target = $('target').value; state.mustChooseTarget = !state.target;
     localStorage.setItem('gpa.target', state.target);
     await refresh();
   });
@@ -286,6 +338,8 @@ function wire() {
     if (more) openMenu(more);
   });
   $('btn-add').onclick = () => {
+    if (state.activeLogin) { $('dlg-add').showModal(); return; }
+    $('add-start').disabled = false; $('add-open').hidden = true; $('add-copy').hidden = true;
     $('add-start').dataset.account = '';
     $('add-name').value = '';
     $('add-status').textContent = '';
@@ -293,14 +347,13 @@ function wire() {
     $('dlg-add').showModal();
   };
   $('add-start').onclick = startLogin;
+  $('add-cancel').onclick = cancelLogin;
+  $('dlg-add').addEventListener('cancel', (e) => { e.preventDefault(); cancelLogin(); });
+  $('ops-list').onclick = (e) => { const b = e.target.closest('[data-operation]'); if (b) { $('dlg-ops').close(); continueOperation(b.dataset.operation); } };
+  $('detail-body').onclick = async (e) => { const b = e.target.closest('[data-restore]'); if (b) { try { await api('/api/v1/accounts/' + b.dataset.restore, {method:'PATCH',body:JSON.stringify({archived:false})}); $('dlg-detail').close(); await refresh(); } catch (err) { setResult(err.message); } } };
+  $('settings-archived').onclick = () => showArchived().catch((err) => setResult(err.message));
   $('detail-close').onclick = () => $('dlg-detail').close();
-  $('btn-ops').onclick = async () => {
-    const data = await api('/api/v1/operations');
-    $('ops-list').innerHTML = (data.operations || []).map((op) =>
-      `<li><strong>${escapeText(op.account)}</strong> ${escapeText(op.target)} · ${escapeText(op.status)}<div class="meta">${escapeText(op.message || '')}</div></li>`
-    ).join('') || '<li>还没有操作</li>';
-    $('dlg-ops').showModal();
-  };
+  $('btn-ops').onclick = showOperations;
   $('ops-close').onclick = () => $('dlg-ops').close();
   $('btn-settings').onclick = async () => {
     const d = await api('/api/v1/diagnostics');
@@ -308,16 +361,8 @@ function wire() {
     $('dlg-settings').showModal();
   };
   $('settings-close').onclick = () => $('dlg-settings').close();
-  $('settings-import').onclick = async () => {
-    const prev = await api('/api/v1/imports/preview', { method: 'POST', body: '{}' });
-    if (!(prev.new || []).length) {
-      setResult('没有可导入的新账号');
-      return;
-    }
-    const res = await api('/api/v1/imports', { method: 'POST', body: '{}' });
-    setResult('新增 ' + res.added + ' 个，跳过 ' + res.skipped + ' 个，冲突 ' + res.conflicts + ' 个');
-    await refresh();
-  };
+  $('settings-import').onclick = importAccounts;
+  $('btn-import').onclick = importAccounts;
   $('settings-diag').onclick = async () => {
     const d = await api('/api/v1/diagnostics');
     $('detail-title').textContent = '诊断';
@@ -332,6 +377,9 @@ async function main() {
     await bootstrap();
     $('conn').textContent = '服务已连接';
     await refresh();
+    if (state.pendingOp) await continueOperation(state.pendingOp);
+    if (state.activeLogin) { $('dlg-add').showModal(); $('add-start').disabled = true; await pollLogin(); }
+    setInterval(() => { if (!state.busy && !document.hidden) refresh(); }, 5000);
   } catch (err) {
     showBanner(err.message + '。请用 GPA 启动器打开。', 'offline');
   }

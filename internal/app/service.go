@@ -1,10 +1,12 @@
 package app
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -15,12 +17,14 @@ import (
 )
 
 type Service struct {
-	Store  *gpa.Store
-	Demo   bool
-	Probe  ProbeFunc
-	Switch SwitchFunc
-	Login  LoginFunc
+	Store        *gpa.Store
+	Demo         bool
+	Probe        ProbeFunc
+	Switch       SwitchFunc
+	Login        LoginFunc
+	LoginCommand func(context.Context, []string) *exec.Cmd
 
+	opMu   sync.Mutex
 	mu     sync.Mutex
 	logins map[string]*asyncLogin
 }
@@ -50,9 +54,7 @@ func newID(prefix string) string {
 }
 
 func (s *Service) Status(selected string) (StatusView, error) {
-	if err := s.Store.Ensure(); err != nil {
-		return StatusView{}, err
-	}
+
 	clients := s.Store.LoadClients()
 	targets := s.targets(clients)
 	if selected == "" {
@@ -60,8 +62,12 @@ func (s *Service) Status(selected string) (StatusView, error) {
 	}
 	tv, err := s.targetByID(targets, selected)
 	if err != nil {
-		selected = s.preferredTarget(targets)
-		tv, _ = s.targetByID(targets, selected)
+		// An empty installation has no target yet, but the web manager must
+		// still open so the user can import accounts or inspect setup state.
+		if selected != "" {
+			return StatusView{}, err
+		}
+		tv = TargetView{}
 	}
 	lives := s.liveByStorage(clients)
 	accounts := s.listAccounts(false, clients, lives)
@@ -194,6 +200,11 @@ func (s *Service) AccountDetail(ref string) (AccountView, error) {
 }
 
 func (s *Service) PatchAccount(ref, displayName string, archived *bool) (AccountView, error) {
+	release, err := s.lockMutation()
+	if err != nil {
+		return AccountView{}, err
+	}
+	defer release()
 	acct, err := s.Store.ResolveAccount(ref)
 	if err != nil {
 		return AccountView{}, err
@@ -344,7 +355,7 @@ func writeJSON(path string, obj any) error {
 		return err
 	}
 	raw = append(raw, '\n')
-	return os.WriteFile(path, raw, 0o600)
+	return gpa.AtomicWriteFile(path, raw)
 }
 
 func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
@@ -354,3 +365,75 @@ type appError struct{ msg string }
 func (e *appError) Error() string { return e.msg }
 
 func errf(msg string) error { return &appError{msg: msg} }
+
+func (s *Service) lockMutation() (func(), error) {
+	s.opMu.Lock()
+	lock, err := gpa.AcquireLock(s.Store.LockPath())
+	if err != nil {
+		s.opMu.Unlock()
+		return nil, err
+	}
+	return func() { lock.Release(); s.opMu.Unlock() }, nil
+}
+
+// Recover is called once by the sole host before accepting requests.
+func (s *Service) Recover() error {
+	release, err := s.lockMutation()
+	if err != nil {
+		return err
+	}
+	defer release()
+	_, journalErr := os.Stat(filepath.Join(s.Store.Root, "switch-journal.json"))
+	recoveryErr := gpa.RecoverTransaction(s.Store)
+	for _, op := range s.ListOps(0) {
+		if op.Status != "running" && op.Status != "queued" {
+			continue
+		}
+		op.Status = "failed"
+		op.ReasonCode = "INTERRUPTED"
+		op.Message = "后台中断，请检查恢复结果后重试"
+		status := "unknown"
+		if journalErr == nil {
+			status = "restored"
+		}
+		if recoveryErr != nil {
+			status = "failed"
+			op.Message = recoveryErr.Error()
+		}
+		op.Recovery = map[string]any{"status": status}
+		op.UpdatedAt = nowISO()
+		if err := s.saveOp(op); err != nil {
+			return err
+		}
+	}
+	entries, _ := os.ReadDir(s.loginsDir())
+	for _, entry := range entries {
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		r, err := s.loadLogin(id)
+		if err != nil {
+			continue
+		}
+		if r.Status == "starting" || r.Status == "waiting_authorization" {
+			r.Status = "expired"
+			r.Message = "后台已重启，请重新开始授权"
+			r.UserCode = ""
+			r.VerificationURL = ""
+			if err := s.saveLogin(r); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) ArchivedAccounts() []AccountView {
+	clients := s.Store.LoadClients()
+	all := s.listAccounts(true, clients, s.liveByStorage(clients))
+	out := []AccountView{}
+	for _, a := range all {
+		if a.Archived {
+			out = append(out, a)
+		}
+	}
+	return out
+}
