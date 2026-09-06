@@ -184,7 +184,7 @@ func useAccount(store *Store, name, target string, force, open, dryRun, interact
 
 	states := map[string]ClientState{}
 	for _, c := range affected {
-		states[c.ID] = inspectClient(c)
+		states[c.ID] = inspectClient(c, true)
 		if states[c.ID].ReasonCode == "QUERY_FAILED" {
 			return Result{Status: "blocked", Account: name, Error: "cannot query client state: " + c.Label}
 		}

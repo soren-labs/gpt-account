@@ -102,7 +102,7 @@ func DoctorPayload(store *Store) map[string]any {
 	byStore := map[string][]Client{}
 	for _, c := range clients {
 		byStore[c.Storage] = append(byStore[c.Storage], c)
-		st := inspectClient(c)
+		st := inspectClient(c, false)
 		auth := loadClientAuth(c)
 		email := ""
 		if auth != nil {

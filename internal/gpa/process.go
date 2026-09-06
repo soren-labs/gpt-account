@@ -1,9 +1,13 @@
 package gpa
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,12 +42,126 @@ func queryFailed() bool {
 	return os.Getenv("GPA_PROC_QUERY") == "fail"
 }
 
+// ---- Windows process snapshot ------------------------------------------------
+//
+// Every WSL -> Windows interop call costs seconds (tasklist.exe ~4s, a CIM query
+// ~4s, a bare PowerShell start ~1s). The web UI polls status every few seconds
+// and each status request used to run two of those calls per client, serially,
+// which is what made the page feel frozen. We now take one PowerShell snapshot
+// that answers both "is ChatGPT.exe running" and "which codex processes exist",
+// cache it briefly, and let read paths return the cached value while a refresh
+// runs in the background. Write paths ask for a fresh snapshot.
+
+type winProcSnapshot struct {
+	chatgpt    bool
+	codexLines string
+	err        error
+	at         time.Time
+}
+
+var (
+	winProcMu         sync.Mutex
+	winProcCache      *winProcSnapshot
+	winProcRefreshing bool
+	winProcFreshFor   = 3 * time.Second  // serve without refreshing
+	winProcStaleFor   = 30 * time.Second // serve stale while refreshing in background
+	winProcTimeout    = 20 * time.Second
+)
+
+const winProcScript = `$ErrorActionPreference='SilentlyContinue'; ` +
+	`$app=@(Get-Process -Name ChatGPT); 'CHATGPT=' + $app.Count; ` +
+	`Get-Process -Name codex* | ForEach-Object { 'CODEX=' + $_.ProcessName + ' ' + $_.Path }`
+
+func queryWinProcs() winProcSnapshot {
+	out, err := cmdOutputTimeout(winProcTimeout, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", winProcScript)
+	snap := winProcSnapshot{at: time.Now(), err: err}
+	if err != nil {
+		return snap
+	}
+	var codex []string
+	sawHeader := false
+	for _, line := range strings.Split(strings.ReplaceAll(out, "\x00", ""), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "CHATGPT="):
+			sawHeader = true
+			n, _ := strconv.Atoi(strings.TrimPrefix(line, "CHATGPT="))
+			snap.chatgpt = n > 0
+		case strings.HasPrefix(line, "CODEX="):
+			codex = append(codex, strings.TrimPrefix(line, "CODEX="))
+		}
+	}
+	if !sawHeader {
+		snap.err = fmt.Errorf("unexpected process query output")
+	}
+	snap.codexLines = strings.Join(codex, "\n")
+	return snap
+}
+
+// winProcs returns the Windows process snapshot. fresh forces a synchronous
+// re-query; otherwise a recent snapshot is returned and, if it is getting old,
+// refreshed in the background so the caller never waits.
+func winProcs(fresh bool) winProcSnapshot {
+	winProcMu.Lock()
+	cached := winProcCache
+	if !fresh && cached != nil && time.Since(cached.at) < winProcStaleFor {
+		if time.Since(cached.at) >= winProcFreshFor && !winProcRefreshing {
+			winProcRefreshing = true
+			go func() {
+				snap := queryWinProcs()
+				winProcMu.Lock()
+				winProcCache = &snap
+				winProcRefreshing = false
+				winProcMu.Unlock()
+			}()
+		}
+		winProcMu.Unlock()
+		return *cached
+	}
+	winProcMu.Unlock()
+	snap := queryWinProcs()
+	winProcMu.Lock()
+	winProcCache = &snap
+	winProcMu.Unlock()
+	return snap
+}
+
+func invalidateWinProcs() {
+	winProcMu.Lock()
+	winProcCache = nil
+	winProcMu.Unlock()
+}
+
+func cmdOutputTimeout(d time.Duration, name string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	if !onWindows() {
+		if exists("/mnt/c/Windows/System32") {
+			cmd.Dir = "/mnt/c/Windows/System32"
+		} else {
+			cmd.Dir = os.TempDir()
+		}
+	}
+	out, err := cmd.Output()
+	text := strings.TrimSpace(strings.ReplaceAll(string(out), "\r", ""))
+	if ctx.Err() != nil {
+		return text, fmt.Errorf("%s timed out after %s", name, d)
+	}
+	return text, err
+}
+
+// ---- ChatGPT App --------------------------------------------------------------
+
 func chatgptRunning() bool {
-	running, err := queryChatGPT()
+	running, err := queryChatGPTFresh()
 	return err == nil && running
 }
 
-func queryChatGPT() (bool, error) {
+func queryChatGPT() (bool, error)      { return queryChatGPTMode(false) }
+func queryChatGPTFresh() (bool, error) { return queryChatGPTMode(true) }
+
+func queryChatGPTMode(fresh bool) (bool, error) {
 	if os.Getenv("GPA_FAKE_APP") == "running" {
 		return true, nil
 	}
@@ -53,11 +171,11 @@ func queryChatGPT() (bool, error) {
 	if queryFailed() {
 		return false, fmt.Errorf("process query disabled")
 	}
-	blob, err := cmdOutputErr("tasklist.exe", "/FI", "IMAGENAME eq ChatGPT.exe")
-	if err != nil {
-		return false, err
+	snap := winProcs(fresh)
+	if snap.err != nil {
+		return false, snap.err
 	}
-	return strings.Contains(blob, "ChatGPT.exe"), nil
+	return snap.chatgpt, nil
 }
 
 func stopChatGPT(force bool) {
@@ -69,6 +187,7 @@ func stopChatGPT(force bool) {
 		args = append(args, "/F")
 	}
 	_ = runSilent("taskkill.exe", args...)
+	invalidateWinProcs()
 	if force {
 		return
 	}
@@ -90,6 +209,7 @@ func startChatGPT() bool {
 		aumid = "OpenAI.Codex_2p2nqsd0c76g0!App"
 	}
 	_ = runSilent("powershell.exe", "-NoProfile", "-Command", "Start-Process 'shell:AppsFolder\\"+aumid+"'")
+	invalidateWinProcs()
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if chatgptRunning() {
@@ -100,16 +220,26 @@ func startChatGPT() bool {
 	return chatgptRunning()
 }
 
+var (
+	aumidOnce  sync.Once
+	aumidValue string
+)
+
+// queryStartAUMID resolves the Start-menu AppID once per process; Get-StartApps
+// costs ~2s and the answer does not change while the manager runs.
 func queryStartAUMID() string {
-	out := cmdOutput("powershell.exe", "-NoProfile", "-Command",
-		"Get-StartApps | Where-Object Name -Match 'ChatGPT|Codex' | Select-Object -ExpandProperty AppID")
-	for _, line := range strings.Split(out, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "OpenAI.Codex") || strings.Contains(line, "ChatGPT") {
-			return line
+	aumidOnce.Do(func() {
+		out, _ := cmdOutputTimeout(winProcTimeout, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+			"Get-StartApps | Where-Object Name -Match 'ChatGPT|Codex' | Select-Object -ExpandProperty AppID")
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.Contains(line, "OpenAI.Codex") || strings.Contains(line, "ChatGPT") {
+				aumidValue = line
+				return
+			}
 		}
-	}
-	return ""
+	})
+	return aumidValue
 }
 
 func stopWait() time.Duration {
@@ -180,12 +310,16 @@ func clientSide(c Client) string {
 	return currentSide()
 }
 
+// ---- Codex CLI ----------------------------------------------------------------
+
 func unmanagedCodexOn(c Client) bool {
-	running, err := queryUnmanagedCodex(c)
+	running, err := queryUnmanagedCodexMode(c, true)
 	return err == nil && running
 }
 
-func queryUnmanagedCodex(c Client) (bool, error) {
+func queryUnmanagedCodex(c Client) (bool, error) { return queryUnmanagedCodexMode(c, false) }
+
+func queryUnmanagedCodexMode(c Client, fresh bool) (bool, error) {
 	fake := os.Getenv("GPA_FAKE_CLI")
 	if fake == "running" || fake == "all" {
 		return true, nil
@@ -206,11 +340,11 @@ func queryUnmanagedCodex(c Client) (bool, error) {
 	home := c.CodexHome()
 	switch {
 	case side == "windows":
-		return windowsCodexRunning(home)
+		return windowsCodexRunning(home, fresh)
 	case strings.HasPrefix(side, "wsl:"):
 		return wslCodexRunning(strings.TrimPrefix(side, "wsl:"), home)
 	default:
-		out, err := cmdOutputErr("bash", "-lc", "ps -eo args")
+		out, err := localProcessArgs()
 		if err != nil {
 			return false, err
 		}
@@ -218,18 +352,25 @@ func queryUnmanagedCodex(c Client) (bool, error) {
 	}
 }
 
-func windowsCodexRunning(home string) (bool, error) {
-	out, err := cmdOutputErr("powershell.exe", "-NoProfile", "-Command",
-		"Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'codex' } | Select-Object -ExpandProperty CommandLine")
-	if err != nil {
-		return false, err
+func windowsCodexRunning(home string, fresh bool) (bool, error) {
+	snap := winProcs(fresh)
+	if snap.err != nil {
+		return false, snap.err
 	}
-	return linuxCodexLines(out, home), nil
+	return linuxCodexLines(snap.codexLines, home), nil
+}
+
+// localProcessArgs lists the argv of every process on this POSIX host without
+// going through a login shell.
+func localProcessArgs() (string, error) {
+	return cmdOutputTimeout(10*time.Second, "ps", "-eo", "args")
 }
 
 func wslCodexRunning(distro, home string) (bool, error) {
-	if distro == "" {
-		out, err := cmdOutputErr("bash", "-lc", "ps -eo args")
+	// Inside WSL the manager already runs in the distro it is asked about;
+	// a local ps is ~10ms where a wsl.exe round trip is a couple hundred.
+	if distro == "" || (!onWindows() && distro == currentWSLDistro()) {
+		out, err := localProcessArgs()
 		if err != nil {
 			return false, err
 		}
@@ -242,7 +383,7 @@ func wslCodexRunning(distro, home string) (bool, error) {
 			posixHome = home
 		}
 	}
-	out, err := cmdOutputErr("wsl.exe", "-d", distro, "-e", "bash", "-lc", "ps -eo args")
+	out, err := cmdOutputTimeout(winProcTimeout, "wsl.exe", "-d", distro, "-e", "ps", "-eo", "args")
 	if err != nil {
 		return false, err
 	}
@@ -269,11 +410,13 @@ func linuxCodexLines(out, home string) bool {
 	return false
 }
 
-func appState() ClientState {
+// ---- Client state -------------------------------------------------------------
+
+func appState(fresh bool) ClientState {
 	if os.Getenv("GPA_CHATGPT") == "off" {
 		return ClientState{Process: ProcNone, Presence: PresenceNone, Detail: "GPA_CHATGPT=off"}
 	}
-	running, err := queryChatGPT()
+	running, err := queryChatGPTMode(fresh)
 	if err != nil {
 		return ClientState{Process: ProcUnknown, Presence: PresenceUnknown, ReasonCode: "QUERY_FAILED", Detail: "无法查询 ChatGPT.exe: " + err.Error()}
 	}
@@ -283,8 +426,8 @@ func appState() ClientState {
 	return ClientState{Process: ProcNone, Presence: PresenceNone, Detail: "未运行"}
 }
 
-func cliState(c Client) ClientState {
-	running, err := queryUnmanagedCodex(c)
+func cliState(c Client, fresh bool) ClientState {
+	running, err := queryUnmanagedCodexMode(c, fresh)
 	if err != nil {
 		return ClientState{Process: ProcUnknown, Presence: PresenceUnknown, ReasonCode: "QUERY_FAILED", Detail: "无法查询 " + clientSide(c) + " 进程: " + err.Error()}
 	}
@@ -294,19 +437,24 @@ func cliState(c Client) ClientState {
 	return ClientState{Process: ProcNone, Presence: PresenceNone}
 }
 
-func InspectClient(c Client) ClientState { return inspectClient(c) }
+// InspectClient answers from a recent snapshot; use it on read paths such as
+// status polling where a few seconds of staleness is acceptable.
+func InspectClient(c Client) ClientState { return inspectClient(c, false) }
 
-func inspectClient(c Client) ClientState {
+// InspectClientFresh always re-queries; use it before deciding to write.
+func InspectClientFresh(c Client) ClientState { return inspectClient(c, true) }
+
+func inspectClient(c Client, fresh bool) ClientState {
 	st := ClientState{Client: c}
 	if c.Kind == "app" {
-		app := appState()
+		app := appState(fresh)
 		st.Process = app.Process
 		st.Presence = app.Presence
 		st.ReasonCode = app.ReasonCode
 		st.Detail = app.Detail
 		return st
 	}
-	cli := cliState(c)
+	cli := cliState(c, fresh)
 	st.Process = cli.Process
 	st.Presence = cli.Presence
 	st.ReasonCode = cli.ReasonCode

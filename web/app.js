@@ -313,7 +313,20 @@ function escapeText(s) {
 }
 function escapeAttr(s) { return escapeText(s); }
 
+let refreshing = false;
 async function refresh() {
+  // Polling must never stack requests: if the previous status call is still in
+  // flight (slow interop probe), skip this tick instead of queuing another.
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    await refreshOnce();
+  } finally {
+    refreshing = false;
+  }
+}
+
+async function refreshOnce() {
   try {
     state.status = await api('/api/v1/status?target=' + encodeURIComponent(state.target || ''));
     if (state.target && !(state.status.targets || []).some((x) => x.id === state.target)) {

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 var winDrive = regexp.MustCompile(`(?i)^([A-Za-z]):[/\\](.*)$`)
@@ -94,6 +95,32 @@ func cmdOutputErr(name string, args ...string) (string, error) {
 		return text, err
 	}
 	return text, nil
+}
+
+// discoveryMemo caches the output of host-discovery interop commands whose
+// answers do not change for the lifetime of the process (Windows profile
+// directories, the WSL distro list, other distros' home directories). Each one
+// costs a WSL→Windows round trip, and DiscoverClients runs on every status
+// poll, so without this the web UI paid for them again and again.
+var discoveryMemo struct {
+	mu   sync.Mutex
+	data map[string]string
+}
+
+func memoOutput(key string, fetch func() string) string {
+	discoveryMemo.mu.Lock()
+	defer discoveryMemo.mu.Unlock()
+	if discoveryMemo.data == nil {
+		discoveryMemo.data = map[string]string{}
+	}
+	if v, ok := discoveryMemo.data[key]; ok {
+		return v
+	}
+	v := fetch()
+	if v != "" {
+		discoveryMemo.data[key] = v
+	}
+	return v
 }
 
 func windowsUserProfile() string {

@@ -121,7 +121,7 @@ func TestQueryFailureIsUnknown(t *testing.T) {
 	if app.ID == "" {
 		t.Fatal("no app client")
 	}
-	st := inspectClient(app)
+	st := inspectClient(app, true)
 	if st.Process != ProcUnknown {
 		t.Fatalf("query failure became %s", st.Process)
 	}
