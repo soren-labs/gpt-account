@@ -31,11 +31,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     login = sub.add_parser("login", aliases=["capture"], help="login another account in an isolated home")
     login.add_argument("name")
+    login.add_argument("--force", action="store_true", help="replace a different identity already in this slot")
 
     use = sub.add_parser("use", aliases=["switch"], help="activate a saved account")
     use.add_argument("name")
     use.add_argument("--no-restart", action="store_true")
-    use.add_argument("--force", action="store_true", help="do not wait; stop the App immediately")
+    use.add_argument("--force", action="store_true", help="force-stop ChatGPT even if it is still running")
 
     save = sub.add_parser("save", help="snapshot the current live login")
     save.add_argument("name", nargs="?")
@@ -197,7 +198,7 @@ def run(argv: Sequence[str] | None = None, *, stdin=None, stdout=None) -> int:
         if cmd in {"login", "capture"}:
             print(f"starting isolated login for slot {args.name}", file=sys.stderr)
             print("use a private/incognito window; do not click Logout in ChatGPT.exe", file=sys.stderr)
-            result = login_account(store, args.name)
+            result = login_account(store, args.name, force=args.force)
             if as_json:
                 _print_json(result, stdout)
             else:

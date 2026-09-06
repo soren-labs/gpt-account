@@ -1,61 +1,49 @@
-# gpt-account (`gpa`)
+# gpt-account (`GPA`)
 
-本地切换 ChatGPT / Codex 官方登录。每个账号只做一次设备码授权，之后切号只换 `auth.json`，不再走网页登录。
+人类双击打开本地网页管理 ChatGPT / Codex 账号。Agent 用同一个后台上的 Python 脚本和 Skill 操作。不要在 App 里点 Logout。
 
-这是 Astra 规划里的 **第一阶段：本地 CLI**。VPS 部署和跨机器凭据接力还没做。
+这是本机管理。VPS、跨机器接力和云同步还没做。
 
-## 安装
+## 人类
 
-```bash
-pip install -e '.[dev]'
-```
+解压 Windows 包后双击 `GPA Manager.exe`。不需要安装 Python、Node 或 Go。
 
-会提供两个命令：`gpa` 和 `gpt-account`。
+首页只有：
 
-## 从现有槽位导入
+- 切换到哪里，默认桌面端
+- 账号列表和「切换」
+- 添加账号
+- 最近操作、设置
 
-如果本机已经有 `~/.local/share/gpt-accounts`（之前的原型脚本）：
+没有阻塞时点一次即可。需要重启 App 时，页面会写明「重启并切换到哪个账号」。Windows App 和 Windows CLI 如果共用登录，页面会说明会一起更新。「本机全部」必须自己选。
 
-```bash
-gpa migrate
-gpa list
-```
-
-默认写入 `~/.local/share/gpa`，不会改旧目录里的文件。
-
-## 日常用法
+从源码启动演示数据：
 
 ```bash
-gpa                 # 终端里选账号
-gpa use plus        # 写入 Windows + WSL 的 auth.json，并重启 ChatGPT.exe
-gpa use biz1 --no-restart
-gpa status
-gpa list            # 只读，不会回写令牌
-gpa save            # 把当前 live 登录存进对应槽
-gpa login biz3      # 独立目录跑 codex login --device-auth，不动正在用的号
+export PATH="$HOME/.local/go/bin:$PATH"
+go run ./cmd/gpa-manager --demo --listen 127.0.0.1:18765
 ```
 
-切号顺序：停掉 ChatGPT → 把 live 里刚轮转过的令牌收回原槽 → 写入目标账号 → 启动 → 核对两边 `auth.json` 身份一致。
+## Agent
 
-同一 Business workspace 的两个席位按 `user_id + workspace_id` 区分，不会再被 workspace UUID 误判成同一个人。
+```bash
+python3 agent/gpa_agent.py status
+python3 agent/gpa_agent.py accounts
+python3 agent/gpa_agent.py preview --account biz1 --target desktop
+python3 agent/gpa_agent.py switch --plan-id PLAN_ID --request-id REQUEST_ID
+python3 agent/gpa_agent.py operation --id OP_ID
+```
 
-## 不要做的事
-
-不要在 ChatGPT App 里点 Logout。官方登出会清掉桌面会话，还可能作废 refresh token。要换号就 `gpa use`。
-
-会话目录不按账号拆。三个官方号共用同一份 Codex 历史。
-
-## 环境变量
-
-| 变量 | 作用 |
-|---|---|
-| `GPA_STORE` | 账号库目录，默认 `~/.local/share/gpa` |
-| `GPA_CODEX_HOME` | WSL / Linux 的 Codex home |
-| `GPA_WINDOWS_CODEX` | ChatGPT.exe 读的 Windows Codex home |
-| `GPA_CHATGPT` | `auto` 或 `off`（测试用，不杀进程） |
+脚本只输出 JSON。Skill 在 `skills/gpa-account-manager/`。需要重启正在运行的 App 时，脚本返回 `waiting_user`，请到网页确认，不要结束当前会话。
 
 ## 开发
 
 ```bash
-python -m pytest
+export PATH="$HOME/.local/go/bin:$PATH"
+go test ./...
+./scripts/package-web.sh
 ```
+
+测试用伪造 JWT 和临时目录，不碰真实 `auth.json`，也不重启 ChatGPT。
+
+旧终端 `gpa` 仍可编译，不再作为产品入口。`src/gpa` 是更早的 Python 原型。
