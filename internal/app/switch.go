@@ -63,8 +63,11 @@ func (s *Service) Preview(accountRef, targetID string) (Plan, error) {
 		reason = "CREDENTIAL_CONFLICT"
 		detail = "凭据版本冲突: " + strings.Join(conflicts, ", ")
 		already = false
-	} else if already && decision == "ready" {
+	} else if already && reason != "QUERY_FAILED" {
+		// Nothing needs to be written, so a running App or CLI is irrelevant:
+		// do not ask the user to restart anything for a no-op.
 		decision = "noop"
+		reason = ""
 		detail = "所选范围已经是这个账号"
 	}
 

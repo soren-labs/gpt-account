@@ -43,6 +43,31 @@ func TestReviewRealProbePreservesAppRestartReason(t *testing.T) {
 	}
 }
 
+func TestReviewNoopWhenAlreadyCurrentEvenIfAppRunning(t *testing.T) {
+	s := demoSvc(t)
+	s.Demo = false
+	s.Probe = nil
+	t.Setenv("GPA_CHATGPT", "auto")
+	t.Setenv("GPA_FAKE_APP", "running")
+	t.Setenv("GPA_IGNORE_CLI", "1")
+	// The demo seed writes the plus credentials to both client files, so
+	// switching desktop to plus must be a no-op and must not ask for a restart.
+	plan, err := s.Preview("plus", "desktop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Decision != "noop" || plan.ReasonCode != "" || !plan.AlreadyCurrent {
+		t.Fatalf("already-current seat asked for restart: %+v", plan)
+	}
+	env, err := s.Submit(plan.ID, "noop-req", "noop-idem", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Status != "succeeded" {
+		t.Fatalf("noop submit should succeed without touching the App: %+v", env)
+	}
+}
+
 func TestReviewConcurrentIdempotency(t *testing.T) {
 	s := demoSvc(t)
 	p, err := s.Preview("biz1", "desktop")

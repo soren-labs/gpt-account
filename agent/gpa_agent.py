@@ -138,9 +138,26 @@ def ensure_host() -> dict[str, Any]:
         raise RuntimeError("TRANSPORT_UNAVAILABLE: manager did not start")
 
 
+def is_windows_exe(exe: str) -> bool:
+    return exe.lower().endswith(".exe")
+
+
+def store_arg_for(exe: str) -> str:
+    """Store path in the syntax the target executable understands."""
+    if is_windows_exe(exe):
+        return windows_path(store_dir())
+    return str(store_dir())
+
+
 def http_json(method: str, path: str, body: dict[str, Any] | None = None) -> tuple[int, dict[str, Any]]:
     if in_wsl() and not os.environ.get("GPA_FORCE_LOOPBACK"):
-        return stdio_json(method, path, body)
+        # A host already reachable on loopback (started from WSL or from the
+        # Windows exe) must be reused; otherwise the bridge below would spawn a
+        # second host over a different store view.
+        try:
+            checked_runtime()
+        except (OSError, ValueError, RuntimeError):
+            return stdio_json(method, path, body)
     rt = ensure_host()
     token = (store_dir() / "agent.token").read_text(encoding="utf-8").strip()
     req = urllib.request.Request(

@@ -108,7 +108,8 @@ func TestAgentCannotConfirmRestart(t *testing.T) {
 		}
 		return gpa.ClientState{Client: c, Process: gpa.ProcNone, Presence: gpa.PresenceNone}
 	}
-	plan, err := svc.Preview("plus", "desktop")
+	// biz1 is not the current desktop seat, so a running App must block the write.
+	plan, err := svc.Preview("biz1", "desktop")
 	if err != nil {
 		t.Fatal(err)
 	}

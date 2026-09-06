@@ -47,6 +47,11 @@ func run(args []string) int {
 	if runtime.GOOS == "windows" && strings.HasPrefix(*root, "/mnt/") && len(*root) > 7 {
 		*root = strings.ToUpper((*root)[5:6]) + ":" + strings.ReplaceAll((*root)[6:], "/", `\`)
 	}
+	if runtime.GOOS != "windows" && len(*root) > 3 && (*root)[1] == ':' && ((*root)[2] == '\\' || (*root)[2] == '/') {
+		// A Windows-style store path handed to the Linux/WSL binary must map to
+		// /mnt/<drive>/..., never be created literally under the current directory.
+		*root = "/mnt/" + strings.ToLower((*root)[0:1]) + strings.ReplaceAll((*root)[2:], `\`, "/")
+	}
 	cfg := gpa.LoadConfig(*root)
 	if *stdio {
 		return runStdio(cfg.Store)
