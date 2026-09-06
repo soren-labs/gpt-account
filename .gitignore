@@ -14,3 +14,7 @@ auth.json
 *.pem
 *.key
 .DS_Store
+dist/
+/gpa
+*.exe
+.demo-store/

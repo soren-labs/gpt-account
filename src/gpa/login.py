@@ -3,14 +3,14 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from gpa.auth import inspect_auth, is_chatgpt_bundle, same_seat
+from gpa.auth import inspect_auth, is_chatgpt_bundle, same_seat, valid_slot_name
 from gpa.errors import GPAError
 from gpa.fsutil import read_json
 from gpa.store import Store
-from gpa.switcher import preferred_live
 
 
 Runner = Callable[[list[str], dict[str, str], Path], int]
@@ -34,17 +34,32 @@ def login_account(
     *,
     runner: Runner | None = None,
     codex_bin: str | None = None,
+    force: bool = False,
 ) -> dict[str, str]:
-    live = preferred_live(store.cfg)
-    live_ident = inspect_auth(live) if live else None
-    inbox = store.root / "_inbox" / name
-    if inbox.exists():
-        shutil.rmtree(inbox)
-    inbox.mkdir(parents=True)
+    if not valid_slot_name(name):
+        raise GPAError(f"invalid name {name!r}; use letters, digits, . _ -")
+    inbox_root = store.root / "_inbox"
+    inbox_root.mkdir(parents=True, exist_ok=True)
     try:
-        inbox.chmod(0o700)
+        inbox_root.chmod(0o700)
     except OSError:
         pass
+    inbox = Path(tempfile.mkdtemp(prefix=f"{name}-", dir=str(inbox_root)))
+    try:
+        return _capture_into(store, name, inbox, runner=runner, codex_bin=codex_bin, force=force)
+    finally:
+        shutil.rmtree(inbox, ignore_errors=True)
+
+
+def _capture_into(
+    store: Store,
+    name: str,
+    inbox: Path,
+    *,
+    runner: Runner | None,
+    codex_bin: str | None,
+    force: bool,
+) -> dict[str, str]:
     env = os.environ.copy()
     env["CODEX_HOME"] = str(inbox)
     env.pop("OPENAI_API_KEY", None)
@@ -60,13 +75,18 @@ def login_account(
     ident = inspect_auth(auth)
     if not is_chatgpt_bundle(ident):
         raise GPAError("isolated login did not produce a ChatGPT token bundle")
-    if live_ident is not None and same_seat(live_ident, ident):
-        raise GPAError("that login is the same seat already in the App")
     existing = store.find_by_identity(ident)
-    if existing:
+    if existing and existing != name:
         raise GPAError(f"that login is already saved as {existing}")
+    slot_auth = store.slot_dir(name) / "auth.json"
+    if slot_auth.exists():
+        old = inspect_auth(read_json(slot_auth))
+        if not same_seat(old, ident) and not force:
+            raise GPAError(
+                f"slot {name} already holds {old.email or old.user_id[:12]}; use another name or --force"
+            )
     meta = store.put(name, auth, source=str(captured), overwrite=True)
-    store.append_log("login", slot=name, email=ident.email, plan=ident.plan)
+    store.append_log("login", slot=name, email=ident.email, plan=ident.plan, cred_version=meta["cred_version"])
     return {
         "slot": name,
         "email": ident.email,

@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GPA 账号管理</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip" href="#main">跳到主要内容</a>
+  <header class="top">
+    <h1>GPA 账号管理</h1>
+    <nav>
+      <button type="button" id="btn-ops">最近操作</button>
+      <button type="button" id="btn-settings">设置</button>
+    </nav>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <div id="live" class="sr-only" aria-live="polite"></div>
+  <main id="main">
+    <section class="toolbar">
+      <label class="target">
+        <span>切换到哪里</span>
+        <select id="target"></select>
+      </label>
+      <p id="target-note" class="note"></p>
+      <p id="conn" class="conn">正在连接</p>
+    </section>
+    <section class="accounts-head">
+      <h2>你的账号</h2>
+      <button type="button" id="btn-add" class="primary">＋添加账号</button>
+    </section>
+    <div id="empty" class="empty" hidden>
+      <p>还没有保存的账号。可以导入已有账号，或添加一个新账号。</p>
+      <button type="button" id="btn-import">导入已有账号</button>
+    </div>
+    <ul id="accounts" class="list"></ul>
+    <p id="result" class="result" hidden></p>
+  </main>
+
+  <dialog id="dlg-confirm">
+    <h2 id="confirm-title">重启并切换</h2>
+    <p id="confirm-body"></p>
+    <menu>
+      <button type="button" id="confirm-ok" class="primary">重启并切换</button>
+      <button type="button" id="confirm-cancel" value="cancel">取消</button>
+    </menu>
+  </dialog>
+  <dialog id="dlg-wait">
+    <h2>需要先处理</h2>
+    <p id="wait-body"></p>
+    <menu>
+      <button type="button" id="wait-retry" class="primary">我已关闭，重试</button>
+      <button type="button" id="wait-later">稍后</button>
+    </menu>
+  </dialog>
+  <dialog id="dlg-add">
+    <h2>添加账号</h2>
+    <label>备注名 <input id="add-name" placeholder="例如 工作账号"></label>
+    <p id="add-status" class="note"></p>
+    <p id="add-code" class="code" hidden></p>
+    <menu>
+      <button type="button" id="add-start" class="primary">开始登录</button>
+      <button type="button" id="add-open" hidden>打开登录页面</button>
+      <button type="button" id="add-copy" hidden>复制设备码</button>
+      <button type="button" id="add-cancel">取消</button>
+    </menu>
+  </dialog>
+  <dialog id="dlg-detail">
+    <h2 id="detail-title">账号详情</h2>
+    <div id="detail-body"></div>
+    <menu>
+      <button type="button" id="detail-close">关闭</button>
+    </menu>
+  </dialog>
+  <dialog id="dlg-ops">
+    <h2>最近操作</h2>
+    <ul id="ops-list" class="ops"></ul>
+    <menu><button type="button" id="ops-close">关闭</button></menu>
+  </dialog>
+  <dialog id="dlg-settings">
+    <h2>设置</h2>
+    <p id="settings-body" class="note"></p>
+    <menu>
+      <button type="button" id="settings-import">导入已有账号</button>
+      <button type="button" id="settings-archived">已归档账号</button>
+      <button type="button" id="settings-diag">查看诊断</button>
+      <button type="button" id="settings-close">关闭</button>
+    </menu>
+  </dialog>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

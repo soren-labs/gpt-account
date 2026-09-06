@@ -2,25 +2,26 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Protocol
 
 
 class ProcessController(Protocol):
     def running(self) -> bool: ...
-    def stop(self) -> None: ...
-    def start(self) -> None: ...
+    def stop(self, *, force: bool = False) -> None: ...
+    def start(self) -> bool: ...
 
 
 class NoopController:
     def running(self) -> bool:
         return False
 
-    def stop(self) -> None:
+    def stop(self, *, force: bool = False) -> None:
         return None
 
-    def start(self) -> None:
-        return None
+    def start(self) -> bool:
+        return True
 
 
 def _run(argv: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -43,7 +44,10 @@ def discover_chatgpt_exe() -> Path | None:
     apps = Path("/mnt/c/Program Files/WindowsApps")
     if not apps.exists():
         return None
-    matches = sorted(apps.glob("OpenAI.Codex_*/app/ChatGPT.exe"))
+    try:
+        matches = sorted(apps.glob("OpenAI.Codex_*/app/ChatGPT.exe"))
+    except OSError:
+        return None
     return matches[-1] if matches else None
 
 
@@ -52,13 +56,43 @@ def discover_chatgpt_aumid() -> str | None:
     if env:
         return env
     apps = Path("/mnt/c/Program Files/WindowsApps")
-    if not apps.exists():
-        return None
-    packages = sorted(apps.glob("OpenAI.Codex_*"))
-    if not packages:
-        return None
-    family = packages[-1].name.rsplit("_", 1)[0]
-    return f"{family}!App"
+    if apps.exists():
+        try:
+            packages = sorted(apps.glob("OpenAI.Codex_*"))
+        except OSError:
+            packages = []
+        if packages:
+            family = packages[-1].name.rsplit("_", 1)[0]
+            return f"{family}!App"
+    queried = _query_start_aumid()
+    if queried:
+        return queried
+    return "OpenAI.Codex_2p2nqsd0c76g0!App"
+
+
+def _query_start_aumid() -> str | None:
+    result = _run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-Command",
+            "Get-StartApps | Where-Object Name -Match 'ChatGPT|Codex' | Select-Object -ExpandProperty AppID",
+        ]
+    )
+    text = result.stdout.decode("utf-16le", "replace") if result.stdout[:2] == b"\xff\xfe" else result.stdout.decode("utf-8", "replace")
+    for line in text.splitlines():
+        line = line.strip()
+        if "OpenAI.Codex" in line or "ChatGPT" in line:
+            return line
+    return None
+
+
+def _stop_wait_seconds() -> float:
+    raw = os.environ.get("GPA_STOP_WAIT", "10")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 10.0
 
 
 class WindowsChatGPTController:
@@ -67,19 +101,25 @@ class WindowsChatGPTController:
         blob = result.stdout.decode("utf-16le", "replace") if result.stdout[:2] == b"\xff\xfe" else result.stdout.decode("gbk", "replace")
         return "ChatGPT.exe" in blob
 
-    def stop(self) -> None:
-        _run(["taskkill.exe", "/IM", "ChatGPT.exe", "/F"])
+    def stop(self, *, force: bool = False) -> None:
+        if force:
+            _run(["taskkill.exe", "/IM", "ChatGPT.exe", "/F"])
+            return
+        _run(["taskkill.exe", "/IM", "ChatGPT.exe"])
+        deadline = time.time() + _stop_wait_seconds()
+        while self.running() and time.time() < deadline:
+            time.sleep(0.2)
 
-    def start(self) -> None:
+    def start(self) -> bool:
         exe = discover_chatgpt_exe()
         if exe is not None:
             win = _to_windows_path(exe)
             result = _run(["cmd.exe", "/c", "start", "", win])
             if result.returncode == 0:
-                return
+                return True
         aumid = discover_chatgpt_aumid()
         if aumid:
-            _run(
+            result = _run(
                 [
                     "powershell.exe",
                     "-NoProfile",
@@ -87,6 +127,9 @@ class WindowsChatGPTController:
                     f"Start-Process 'shell:AppsFolder\\{aumid}'",
                 ]
             )
+            if result.returncode == 0 or self.running():
+                return True
+        return self.running()
 
 
 def controller_for(mode: str) -> ProcessController:

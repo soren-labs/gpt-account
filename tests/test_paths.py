@@ -1,10 +1,20 @@
 from pathlib import Path
 
-from gpa.paths import _win_path_to_wsl, discover_windows_codex_home, load_config
+from gpa.paths import _exists, _win_path_to_wsl, discover_windows_codex_home, load_config
 
 
 def test_win_path_to_wsl_maps_drive() -> None:
     assert _win_path_to_wsl(r"C:\Users\alex\.codex") == Path("/mnt/c/Users/alex/.codex")
+
+
+def test_exists_swallows_permission_error(tmp_path: Path, monkeypatch) -> None:
+    target = tmp_path / "blocked"
+
+    def boom(self, follow_symlinks=True):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "stat", boom)
+    assert _exists(target) is False
 
 
 def test_discover_honors_override(tmp_path: Path, monkeypatch) -> None:

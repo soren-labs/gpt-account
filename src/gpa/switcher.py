@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,26 +43,57 @@ def load_lives(cfg: Config) -> list[tuple[Path, dict[str, Any]]]:
     return lives
 
 
+def auth_freshness(auth: dict[str, Any], path: Path) -> float:
+    ident = inspect_auth(auth)
+    if ident.last_refresh:
+        try:
+            return datetime.fromisoformat(ident.last_refresh.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def preferred_live(cfg: Config) -> dict[str, Any] | None:
     lives = load_lives(cfg)
     if not lives:
         return None
-    wsl = cfg.live_wsl
-    for path, auth in lives:
-        if path != wsl:
-            return auth
-    return lives[0][1]
+    return max(lives, key=lambda item: auth_freshness(item[1], item[0]))[1]
 
 
 def adopt_lives(store: Store) -> list[str]:
-    matched: list[str] = []
+    best: dict[str, tuple[float, Path, dict[str, Any]]] = {}
     for path, auth in load_lives(store.cfg):
         ident = inspect_auth(auth)
         name = store.find_by_identity(ident)
-        if name:
-            store.put(name, auth, source=str(path), overwrite=True)
-            matched.append(name)
+        if not name:
+            continue
+        score = auth_freshness(auth, path)
+        prev = best.get(name)
+        if prev is None or score > prev[0]:
+            best[name] = (score, path, auth)
+    matched: list[str] = []
+    for name, (_score, path, auth) in best.items():
+        store.put(name, auth, source=str(path), overwrite=True)
+        matched.append(name)
     return matched
+
+
+def _snapshot_lives(cfg: Config) -> list[tuple[Path, bytes | None]]:
+    return [(path, path.read_bytes() if path.exists() else None) for path in cfg.live_paths()]
+
+
+def _restore_lives(backups: list[tuple[Path, bytes | None]]) -> None:
+    for path, old in backups:
+        if old is None:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        else:
+            atomic_write(path, old)
 
 
 def write_live(cfg: Config, auth: dict[str, Any]) -> list[Path]:
@@ -130,26 +162,37 @@ def use_account(
     if not is_chatgpt_bundle(ident):
         raise GPAError(f"slot {name} has no refresh token")
     controller = procs or controller_for(store.cfg.chatgpt_mode)
-    if restart and controller.running() and not force:
-        controller.stop()
+    if restart and controller.running():
+        controller.stop(force=force)
+        if controller.running():
+            if force:
+                raise GPAError("could not stop ChatGPT.exe")
+            raise GPAError("ChatGPT is still running; close it or pass --force")
     adopted = [n for n in adopt_lives(store) if n != name]
-    # re-read after adopt; target slot is unchanged unless live matched it
     acct = store.get(name)
     ident = acct.identity
-    written = write_live(store.cfg, acct.auth)
-    store.set_current(name)
-    store.append_log(
-        "use",
-        slot=name,
-        email=ident.email,
-        plan=ident.plan,
-        adopted=adopted,
-        written=[str(p) for p in written],
-        cred_version=acct.cred_version,
-    )
-    if restart:
-        controller.start()
-    verify_live(store.cfg, ident)
+    live_backup = _snapshot_lives(store.cfg)
+    state_backup = store.state()
+    written: list[Path] = []
+    try:
+        written = write_live(store.cfg, acct.auth)
+        store.set_current(name)
+        store.append_log(
+            "use",
+            slot=name,
+            email=ident.email,
+            plan=ident.plan,
+            adopted=adopted,
+            written=[str(p) for p in written],
+            cred_version=acct.cred_version,
+        )
+        if restart and not controller.start():
+            raise GPAError("could not start ChatGPT.exe")
+        verify_live(store.cfg, ident)
+    except Exception:
+        _restore_lives(live_backup)
+        store.write_state(state_backup)
+        raise
     return {
         "slot": name,
         "email": ident.email,

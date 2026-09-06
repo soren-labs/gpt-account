@@ -5,7 +5,14 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-WIN_USER_SKIP = {"public", "default", "default user", "all users"}
+WIN_USER_SKIP = {"public", "default", "default user", "all users", "codexsandboxoffline"}
+
+
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -75,7 +82,7 @@ def discover_windows_codex_home() -> Path | None:
         if key in seen:
             continue
         seen.add(key)
-        if (home / "auth.json").exists() or home.exists():
+        if _exists(home / "auth.json") or _exists(home):
             existing.append(home)
 
     if not existing:
@@ -104,7 +111,7 @@ def _scan_windows_codex_homes() -> list[Path]:
             if person.name.lower() in WIN_USER_SKIP:
                 continue
             home = person / ".codex"
-            if home.exists():
+            if _exists(home):
                 found.append(home)
     return found
 
