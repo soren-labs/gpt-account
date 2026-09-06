@@ -135,7 +135,7 @@ func TestIndexHTML(t *testing.T) {
 	}
 	var raw bytes.Buffer
 	raw.ReadFrom(res.Body)
-	if res.StatusCode != 200 || !strings.Contains(raw.String(), "GPA 账号管理") {
+	if res.StatusCode != 200 || !strings.Contains(raw.String(), "GPA Manager") || !strings.Contains(raw.String(), "data-i18n") {
 		t.Fatalf("%d %s", res.StatusCode, raw.String())
 	}
 }

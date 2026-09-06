@@ -29,6 +29,7 @@ button {
 button:focus { outline: 3px solid color-mix(in srgb, var(--focus) 45%, white); outline-offset: 2px; }
 button.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
 button:disabled { opacity: .5; cursor: not-allowed; }
+button.lang { min-width: 56px; padding: 8px 10px; color: var(--muted); font-size: 13px; }
 .toolbar { display: grid; gap: 6px; margin: 12px 0 20px; }
 .target { display: grid; gap: 6px; font-weight: 600; }
 select { min-height: 40px; padding: 8px 10px; font: inherit; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
